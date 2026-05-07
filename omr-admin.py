@@ -1092,7 +1092,7 @@ def xray_add_port(user, port, proto, name, destip, destport):
             inbounds = {'tag': tag, 'port': int(port), 'protocol': 'dokodemo-door', 'settings': {'network': proto, 'port': int(destport), 'address': destip}}
             #inbounds = {'tag': user.username + '_redir_' + proto + '_' + str(port), 'port': str(port), 'protocol': 'dokodemo-door', 'settings': {'network': proto, 'port': str(destport), 'address': destip}}
             data['inbounds'].append(inbounds)
-            routing = {'type': 'field','inboundTag': [tag], 'outboundTag': 'OMRLan'}
+            routing = {'type': 'field','inboundTag': [tag], 'outboundTag': 'direct'}
             data['routing']['rules'].append(routing)
     with open('/etc/xray/xray-server.json', 'w') as f:
         json.dump(data, f, indent=4)
