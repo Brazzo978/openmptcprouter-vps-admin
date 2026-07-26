@@ -1,3 +1,27 @@
+omr-vps-admin (0.16+20260725-mqvpn14) unstable; urgency=high
+
+    * Synchronize and validate MQVPN congestion control on client and server.
+    * Synchronize MQVPN MTU, PMTUD, packet size and log-level settings.
+    * Default new MQVPN configurations to CUBIC.
+    * Add isolated MQVPN2 API/config synchronization for the upstream 0.14
+      UDP/ICMP datagram engine.
+    * Validate MPTCP sysctl values and remove shell command injection.
+    * Synchronize NanBBR variable congestion-control aggressiveness.
+
+ -- OpenMPTCProuter <contact@openmptcprouter.com>  Sat, 25 Jul 2026 16:00:00 +0200
+
+omr-vps-admin (0.16+20260519-rpf) unstable; urgency=medium
+
+    * Add XRay reverse port-forward API for forced TCP forwards.
+
+ -- OpenMPTCProuter <contact@openmptcprouter.com>  Tue, 19 May 2026 18:30:00 +0200
+
+omr-vps-admin (0.16+20260516) unstable; urgency=medium
+
+    * Add MQVPN server API and configuration support.
+
+ -- OpenMPTCProuter <contact@openmptcprouter.com>  Sat, 16 May 2026 12:10:00 +0200
+
 omr-vps-admin (0.16+20260507) unstable; urgency=medium
 
     * Fix XRay forced port redirects to use the direct outbound.

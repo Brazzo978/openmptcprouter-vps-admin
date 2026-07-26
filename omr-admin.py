@@ -34,6 +34,7 @@ from os import path
 from ipaddress import ip_address, IPv4Address, IPv6Address
 import logging
 import asyncio
+import fcntl
 import uvicorn
 import jwt
 import requests
@@ -71,6 +72,95 @@ LOG = logging.getLogger('uvicorn.error')
 PERMANENT_SESSION_LIFETIME = timedelta(hours=24)
 ACCESS_TOKEN_EXPIRE_MINUTES = 1440
 ALGORITHM = "HS256"
+PRIMARY_ROUTER_USERNAME = "openmptcprouter"
+INTERNAL_ADMIN_USERNAME = "admin"
+ALLOWED_AUTH_IDENTITIES = {PRIMARY_ROUTER_USERNAME, INTERNAL_ADMIN_USERNAME}
+NANBBR_AGGRESSIVENESS_MIN = 1
+NANBBR_AGGRESSIVENESS_MAX = 100
+NANBBR_CONFIG_FILE = '/etc/openmptcprouter-vps-admin/nanbbr-var.json'
+MPTCP_LOCK_FILE = '/run/lock/omr-mptcp.lock'
+NANBBR_VAR_MODULES = {
+    'nanbbr1_var': 'tcp_nanbbr1_var',
+    'nanbbr2_var': 'tcp_nanbbr2_var',
+    'nanbbr3_var': 'tcp_nanbbr3_var',
+}
+
+
+def nanbbr_parameter_path(congestion_control):
+    module = NANBBR_VAR_MODULES.get(congestion_control)
+    if module is None:
+        return None
+    return '/sys/module/' + module + '/parameters/aggressiveness'
+
+
+def read_nanbbr_aggressiveness():
+    try:
+        with open(NANBBR_CONFIG_FILE, 'r') as config_file:
+            value = json.load(config_file).get('aggressiveness')
+        value = int(value)
+        if NANBBR_AGGRESSIVENESS_MIN <= value <= NANBBR_AGGRESSIVENESS_MAX:
+            return value
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        pass
+    return None
+
+
+def nanbbr_capabilities():
+    return {
+        congestion_control: (
+            path.isfile(nanbbr_parameter_path(congestion_control))
+            and os.access(nanbbr_parameter_path(congestion_control), os.W_OK)
+        )
+        for congestion_control in NANBBR_VAR_MODULES
+    }
+
+
+def ensure_nanbbr_parameter(congestion_control):
+    module = NANBBR_VAR_MODULES[congestion_control]
+    parameter = nanbbr_parameter_path(congestion_control)
+    subprocess.run(
+        ['modprobe', module],
+        check=False,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    if not path.isfile(parameter) or not os.access(parameter, os.W_OK):
+        raise RuntimeError(module + ' does not expose the aggressiveness parameter')
+    return parameter
+
+
+def atomic_write_file(filename, content, mode=0o644):
+    directory = path.dirname(filename)
+    os.makedirs(directory, exist_ok=True)
+    fd, tmpfile = mkstemp(dir=directory)
+    try:
+        with os.fdopen(fd, 'wb') as output:
+            output.write(content)
+            output.flush()
+            os.fsync(output.fileno())
+        os.chmod(tmpfile, mode)
+        os.replace(tmpfile, filename)
+        directory_fd = os.open(directory, os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except Exception:
+        try:
+            os.remove(tmpfile)
+        except OSError:
+            pass
+        raise
+
+
+def nanbbr_config_content(aggressiveness):
+    return (
+        json.dumps(
+            {'version': 1, 'aggressiveness': aggressiveness},
+            sort_keys=True,
+            indent=2,
+        ) + '\n'
+    ).encode('ascii')
 
 # Get main net interface
 FILE = open('/etc/shorewall/params.net', "r")
@@ -271,33 +361,6 @@ def checkIfProcessRunning(processName):
 def file_as_bytes(file):
     with file:
         return file.read()
-
-def get_username_from_userid(userid):
-    if userid == 0:
-        return 'openmptcprouter'
-    with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
-        content = f.read()
-    content = re.sub(r",\s*}", "}", content) # pylint: disable=W1401
-    try:
-        data = json.loads(content)
-    except ValueError as e:
-        return {'error': 'Config file not readable', 'route': 'get_username'}
-    for user in data['users'][0]:
-        if 'userid' in data['users'][0][user] and int(data['users'][0][user]['userid']) == userid:
-            return user
-    return ''
-
-def get_userid_from_username(username):
-    if username == 'openmptcprouter':
-        return 0
-    with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
-        content = f.read()
-    content = re.sub(r",\s*}", "}", content) # pylint: disable=W1401
-    try:
-        data = json.loads(content)
-    except ValueError as e:
-        return {'error': 'Config file not readable', 'route': 'get_username'}
-    return int(data['users'][0][username]['userid'])
 
 def check_username_serial(username, serial):
     with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
@@ -831,7 +894,7 @@ def add_gre_tunnels(addtouser = 'openmptcprouter', addwithip = ''):
                     addr = ip_info['addr']
                     if not IPAddress(addr).is_private() and not IPAddress(addr).is_reserved() and not IPAddress(addr).is_link_local():
                         netmask = ip_info['netmask']
-                        ip = IPNetwork('10.255.249.0/24')
+                        ip = IPNetwork('10.255.250.0/24')
                         with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
                             content = json.load(f)
                         for user in content['users'][0]:
@@ -1101,6 +1164,165 @@ def xray_add_port(user, port, proto, name, destip, destport):
         os.system("systemctl -q restart xray")
 
 
+XRAY_RPF_REVERSE_PORT = 65443
+
+def xray_rpf_safe(value):
+    return re.sub(r'[^A-Za-z0-9_.-]', '_', str(value))
+
+def xray_rpf_user_uuid(user):
+    username = user.username
+    try:
+        with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
+            omr_config_data = json.load(f)
+        return omr_config_data['users'][0][username]['xray']['key']
+    except Exception:
+        return os.popen("jq -r '.inbounds[0].settings.clients[] | select(.email==" + '"' + username + '"' + ") | .id' /etc/xray/xray-server.json").read().rstrip()
+
+def xray_write_config_if_valid(data, initial_md5):
+    fd, tmpfile = mkstemp(suffix='.json')
+    with os.fdopen(fd, 'w') as f:
+        json.dump(data, f, indent=4)
+    if subprocess.call(['xray', 'run', '-test', '-config', tmpfile], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) != 0:
+        os.remove(tmpfile)
+        return {'result': 'error', 'reason': 'XRay generated config is invalid'}
+    os.chmod(tmpfile, 0o644)
+    move(tmpfile, '/etc/xray/xray-server.json')
+    final_md5 = hashlib.md5(file_as_bytes(open('/etc/xray/xray-server.json', 'rb'))).hexdigest()
+    if initial_md5 != final_md5:
+        os.system("systemctl -q restart xray")
+    return {'result': 'done', 'reason': 'changes applied'}
+
+def xray_rpf_add_port(user, port, proto, name, destip, destport):
+    if not str(port).isdigit() or not str(destport).isdigit():
+        return {'result': 'error', 'reason': 'XRay reverse port forwarding supports one TCP port per rule only'}
+    if proto != 'tcp':
+        return {'result': 'error', 'reason': 'XRay reverse port forwarding supports TCP only'}
+    if destip == '' or destport == '':
+        return {'result': 'error', 'reason': 'Destination IP and port are required'}
+    xrayuuid = xray_rpf_user_uuid(user)
+    if xrayuuid == '' or xrayuuid == 'null':
+        return {'result': 'error', 'reason': 'XRay user UUID not found'}
+
+    shorewall_add_port(user, str(XRAY_RPF_REVERSE_PORT), 'tcp', 'xray rpf reverse')
+
+    username = user.username
+    safe_username = xray_rpf_safe(username)
+    reverse_tag = 'omr-rpf-reverse-' + safe_username
+    listener_tag = 'omr-rpf-reverse-listen'
+    public_tag = 'omr-rpf-' + safe_username + '-' + proto + '-' + str(port)
+    legacy_tag = username + '_redir_' + proto + '_' + str(port) + '_to_' + destip + ':' + str(destport)
+    initial_md5 = hashlib.md5(file_as_bytes(open('/etc/xray/xray-server.json', 'rb'))).hexdigest()
+
+    with open('/etc/xray/xray-server.json') as f:
+        data = json.load(f)
+
+    data.setdefault('inbounds', [])
+    data.setdefault('routing', {})
+    data['routing'].setdefault('rules', [])
+
+    listener = None
+    for inbound in data['inbounds']:
+        if inbound.get('tag') == listener_tag:
+            listener = inbound
+            break
+    if listener is None:
+        listener = {
+            'tag': listener_tag,
+            'listen': '0.0.0.0',
+            'port': XRAY_RPF_REVERSE_PORT,
+            'protocol': 'vless',
+            'settings': {'decryption': 'none', 'clients': []},
+            'streamSettings': {'network': 'tcp', 'sockopt': {'tcpMptcp': True, 'mark': 0}}
+        }
+        data['inbounds'].append(listener)
+    listener['listen'] = '0.0.0.0'
+    listener['port'] = XRAY_RPF_REVERSE_PORT
+    listener['protocol'] = 'vless'
+    listener.setdefault('settings', {})
+    listener['settings']['decryption'] = 'none'
+    listener['settings'].setdefault('clients', [])
+    listener['streamSettings'] = {'network': 'tcp', 'sockopt': {'tcpMptcp': True, 'mark': 0}}
+    listener['settings']['clients'] = [
+        c for c in listener['settings']['clients']
+        if c.get('email') != username and c.get('id') != xrayuuid
+    ]
+    listener['settings']['clients'].append({
+        'id': xrayuuid,
+        'email': username,
+        'reverse': {'tag': reverse_tag}
+    })
+
+    remove_tags = [public_tag, legacy_tag]
+    data['inbounds'] = [i for i in data['inbounds'] if i.get('tag') not in remove_tags]
+    data['routing']['rules'] = [
+        r for r in data['routing']['rules']
+        if not any(t in r.get('inboundTag', []) for t in remove_tags)
+    ]
+
+    data['inbounds'].append({
+        'tag': public_tag,
+        'listen': '0.0.0.0',
+        'port': int(port),
+        'protocol': 'tunnel',
+        'settings': {
+            'allowedNetwork': 'tcp',
+            'portMap': {str(port): destip + ':' + str(destport)}
+        },
+        'streamSettings': {'network': 'tcp'}
+    })
+    data['routing']['rules'].append({
+        'type': 'field',
+        'inboundTag': [public_tag],
+        'outboundTag': reverse_tag
+    })
+
+    return xray_write_config_if_valid(data, initial_md5)
+
+def xray_rpf_del_port(user, port, proto, name, destip, destport):
+    username = user.username
+    safe_username = xray_rpf_safe(user.username)
+    public_tag = 'omr-rpf-' + safe_username + '-' + proto + '-' + str(port)
+    listener_tag = 'omr-rpf-reverse-listen'
+    remove_reverse_port = False
+    initial_md5 = hashlib.md5(file_as_bytes(open('/etc/xray/xray-server.json', 'rb'))).hexdigest()
+    with open('/etc/xray/xray-server.json') as f:
+        data = json.load(f)
+    data['inbounds'] = [i for i in data.get('inbounds', []) if i.get('tag') != public_tag]
+    data.setdefault('routing', {})
+    data['routing'].setdefault('rules', [])
+    data['routing']['rules'] = [
+        r for r in data['routing']['rules']
+        if public_tag not in r.get('inboundTag', [])
+    ]
+
+    user_has_public_rpf = any(
+        i.get('tag', '').startswith('omr-rpf-' + safe_username + '-')
+        for i in data.get('inbounds', [])
+    )
+    if not user_has_public_rpf:
+        xrayuuid = xray_rpf_user_uuid(user)
+        for inbound in list(data.get('inbounds', [])):
+            if inbound.get('tag') != listener_tag:
+                continue
+            clients = inbound.get('settings', {}).get('clients', [])
+            inbound['settings']['clients'] = [
+                c for c in clients
+                if c.get('email') != username and c.get('id') != xrayuuid
+            ]
+            if len(inbound['settings']['clients']) == 0:
+                data['inbounds'] = [i for i in data['inbounds'] if i.get('tag') != listener_tag]
+
+    any_public_rpf = any(
+        i.get('tag', '').startswith('omr-rpf-') and i.get('tag') != listener_tag
+        for i in data.get('inbounds', [])
+    )
+    remove_reverse_port = not any_public_rpf
+    result = xray_write_config_if_valid(data, initial_md5)
+    if result.get('result') == 'done' and remove_reverse_port:
+        shorewall_del_port(username, str(XRAY_RPF_REVERSE_PORT), 'tcp', 'xray rpf reverse')
+    return result
+
+
 def v2ray_del_port(user, port, proto, name, destip, destport):
     userid = user.userid
     if userid is None:
@@ -1145,10 +1367,11 @@ def xray_del_port(user, port, proto, name, destip, destport):
     if initial_md5 != final_md5:
         os.system("systemctl -q restart xray")
 
-def shorewall_add_port(user, port, proto, name, fwtype='ACCEPT', source_dip='', dest_ip='', vpn='default', gencomment=''):
+def shorewall_add_port(user, port, proto, name, fwtype='ACCEPT', source_dip='', dest_ip='', vpn='default', gencomment='', dest_port=''):
     userid = user.userid
     if userid is None:
         userid = 0
+    dnat_port = ':' + str(dest_port) if fwtype == 'DNAT' and dest_port not in ('', None) else ''
     initial_md5 = hashlib.md5(file_as_bytes(open('/etc/shorewall/rules', 'rb'))).hexdigest()
     fd, tmpfile = mkstemp()
     with open('/etc/shorewall/rules', 'r') as f, \
@@ -1173,9 +1396,9 @@ def shorewall_add_port(user, port, proto, name, fwtype='ACCEPT', source_dip='', 
             if fwtype == 'ACCEPT':
                 n.write('ACCEPT		net		$FW		' + proto + '	' + port + '	# OMR ' + user.username + ' open ' + name + ' port ' + proto + gencomment + "\n")
             elif fwtype == 'DNAT' and userid == 0:
-                n.write('DNAT		net		vpn:$OMR_ADDR	' + proto + '	' + port + '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + gencomment + "\n")
+                n.write('DNAT		net		vpn:$OMR_ADDR' + dnat_port + '	' + proto + '	' + port + '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + gencomment + "\n")
             elif fwtype == 'DNAT' and userid != 0:
-                n.write('DNAT		net		vpn:$OMR_ADDR_USER' + str(userid) + '	' + proto + '	' + port + '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + gencomment + "\n")
+                n.write('DNAT		net		vpn:$OMR_ADDR_USER' + str(userid) + dnat_port + '	' + proto + '	' + port + '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + gencomment + "\n")
         else:
             net = 'net'
             comment = ''
@@ -1187,12 +1410,12 @@ def shorewall_add_port(user, port, proto, name, fwtype='ACCEPT', source_dip='', 
             if fwtype == 'ACCEPT':
                 n.write('ACCEPT		' + net + '		$FW		' + proto + '	' + port + '	-	' + source_dip + '	# OMR ' + user.username + ' open ' + name + ' port ' + proto + comment + gencomment + "\n")
             elif fwtype == 'DNAT' and vpn != 'default':
-                n.write('DNAT		' + net + '		vpn:' + vpn + '	' + proto + '	' + port + '	-	' + source_dip +  '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + comment +  gencomment + "\n")
+                n.write('DNAT		' + net + '		vpn:' + vpn + dnat_port + '	' + proto + '	' + port + '	-	' + source_dip +  '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + comment +  gencomment + "\n")
                 #n.write('DNAT		' + net + '		vpn:$OMR_ADDR' + '	' + proto + '	' + port + '	-	' + source_dip +  '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + comment +  "\n")
             elif fwtype == 'DNAT' and userid == 0:
-                n.write('DNAT		' + net + '		vpn:$OMR_ADDR	' + proto + '	' + port + '	-	' + source_dip + '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + comment + gencomment + "\n")
+                n.write('DNAT		' + net + '		vpn:$OMR_ADDR' + dnat_port + '	' + proto + '	' + port + '	-	' + source_dip + '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + comment + gencomment + "\n")
             elif fwtype == 'DNAT' and userid != 0:
-                n.write('DNAT		' + net + '		vpn:$OMR_ADDR_USER' + str(userid) + '	' + proto + '	' + port + '	-	' + source_dip + '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + comment + gencomment + "\n")
+                n.write('DNAT		' + net + '		vpn:$OMR_ADDR_USER' + str(userid) + dnat_port + '	' + proto + '	' + port + '	-	' + source_dip + '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + comment + gencomment + "\n")
     os.close(fd)
     move(tmpfile, '/etc/shorewall/rules')
     final_md5 = hashlib.md5(file_as_bytes(open('/etc/shorewall/rules', 'rb'))).hexdigest()
@@ -1225,10 +1448,12 @@ def shorewall_del_port(username, port, proto, name, fwtype='ACCEPT', source_dip=
     if initial_md5 != final_md5:
         os.system("systemctl -q reload shorewall")
 
-def shorewall6_add_port(user, port, proto, name, fwtype='ACCEPT', source_dip='', dest_ip='', gencomment=''):
+def shorewall6_add_port(user, port, proto, name, fwtype='ACCEPT', source_dip='', dest_ip='', gencomment='', dest_port=''):
     userid = user.userid
     if userid is None:
         userid = 0
+    vpn = 'default'
+    dnat_port = ':' + str(dest_port) if fwtype == 'DNAT' and dest_port not in ('', None) else ''
     initial_md5 = hashlib.md5(file_as_bytes(open('/etc/shorewall6/rules', 'rb'))).hexdigest()
     fd, tmpfile = mkstemp()
     with open('/etc/shorewall6/rules', 'r') as f, open(tmpfile, 'a+') as n:
@@ -1252,9 +1477,9 @@ def shorewall6_add_port(user, port, proto, name, fwtype='ACCEPT', source_dip='',
             if fwtype == 'ACCEPT':
                 n.write('ACCEPT		net		$FW		' + proto + '	' + port + '	# OMR ' + user.username + ' open ' + name + ' port ' + proto + gencomment + "\n")
             elif fwtype == 'DNAT' and userid == 0:
-                n.write('DNAT		net		vpn:$OMR_ADDR	' + proto + '	' + port + '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + gencomment + "\n")
+                n.write('DNAT		net		vpn:$OMR_ADDR' + dnat_port + '	' + proto + '	' + port + '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + gencomment + "\n")
             elif fwtype == 'DNAT' and userid != 0:
-                n.write('DNAT		net		vpn:$OMR_ADDR_USER' + str(userid) + '	' + proto + '	' + port + '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + gencomment + "\n")
+                n.write('DNAT		net		vpn:$OMR_ADDR_USER' + str(userid) + dnat_port + '	' + proto + '	' + port + '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + gencomment + "\n")
         else:
             net = 'net'
             comment = ''
@@ -1266,11 +1491,11 @@ def shorewall6_add_port(user, port, proto, name, fwtype='ACCEPT', source_dip='',
             if fwtype == 'ACCEPT':
                 n.write('ACCEPT		' + net + '		$FW		' + proto + '	' + port +  '	-	' + source_dip + '	# OMR ' + user.username + ' open ' + name + ' port ' + proto + comment + gencomment + "\n")
             elif fwtype == 'DNAT' and vpn != 'default':
-                n.write('DNAT		' + net + '		vpn:' + vpn + '	' + proto + '	' + port + '	-	' + source_dip +  '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + comment +  gencomment + "\n")
+                n.write('DNAT		' + net + '		vpn:' + vpn + dnat_port + '	' + proto + '	' + port + '	-	' + source_dip +  '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + comment +  gencomment + "\n")
             elif fwtype == 'DNAT' and userid == 0:
-                n.write('DNAT		' + net + '		vpn:$OMR_ADDR	' + proto + '	' + port +  '	-	' + source_dip + '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + comment + gencomment + "\n")
+                n.write('DNAT		' + net + '		vpn:$OMR_ADDR' + dnat_port + '	' + proto + '	' + port +  '	-	' + source_dip + '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + comment + gencomment + "\n")
             elif fwtype == 'DNAT' and userid != 0:
-                n.write('DNAT		' + net + '		vpn:$OMR_ADDR_USER' + str(userid) + '	' + proto + '	' + port +  '	-	' + source_dip + '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + comment + gencomment + "\n")
+                n.write('DNAT		' + net + '		vpn:$OMR_ADDR_USER' + str(userid) + dnat_port + '	' + proto + '	' + port +  '	-	' + source_dip + '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + comment + gencomment + "\n")
     os.close(fd)
     move(tmpfile, '/etc/shorewall6/rules')
     final_md5 = hashlib.md5(file_as_bytes(open('/etc/shorewall6/rules', 'rb'))).hexdigest()
@@ -1357,7 +1582,18 @@ def get_user(db, username: str):
         user_dict = db[username]
         return UserInDB(**user_dict)
 
+def get_primary_router_user():
+    with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
+        omr_config_data = json.load(f)
+    router_user = get_user(omr_config_data['users'][0], PRIMARY_ROUTER_USERNAME)
+    if router_user is None:
+        raise HTTPException(status_code=500, detail="Primary router user not configured")
+    return router_user
+
 def authenticate_user(fake_db, username: str, password: str):
+    if username not in ALLOWED_AUTH_IDENTITIES:
+        LOG.debug("unsupported authentication identity")
+        return False
     user = get_user(fake_db, username)
     if not user:
         LOG.debug("user doesn't exist")
@@ -1482,7 +1718,7 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         username: str = payload.get("sub")
-        if username is None:
+        if username not in ALLOWED_AUTH_IDENTITIES:
             LOG.debug("get_current_user: Username not found")
             raise credentials_exception
         token_data = TokenData(username=username)
@@ -1615,15 +1851,10 @@ async def mptcpsupport(request: Request):
 
 # Get VPS status
 @app.get('/status', summary="Get current server load average, uptime and release")
-async def status(userid: Optional[int] = Query(None), username: Optional[str] = Query(None), serial: Optional[str] = Query(None), current_user: User = Depends(get_current_user)):
+async def status(serial: Optional[str] = Query(None), current_user: User = Depends(get_current_user)):
     LOG.debug('Get status...')
-    if not current_user.permissions == "admin":
-        userid = current_user.userid
-    elif username is not None:
-        userid = get_userid_from_username(username)
-    if userid is None:
-        userid = 0
-    username = get_username_from_userid(userid)
+    userid = 0
+    username = PRIMARY_ROUTER_USERNAME
     if not current_user.permissions == "admin" and serial is not None:
         if not check_username_serial(username, serial):
             return {'error': 'False serial number'}
@@ -1660,12 +1891,15 @@ async def status(userid: Optional[int] = Query(None), username: Optional[str] = 
             omr_config_data = json.load(f)
         except ValueError as e:
             omr_config_data = {}
+    router_user = get_user(omr_config_data['users'][0], PRIMARY_ROUTER_USERNAME)
+    if router_user is None:
+        return {'error': 'Primary router user not configured', 'route': 'status'}
     proxy = 'shadowsocks'
     if 'proxy' in omr_config_data['users'][0][username]:
         proxy = omr_config_data['users'][0][username]['proxy']
-    shadowsocks_port = current_user.shadowsocks_port
+    shadowsocks_port = router_user.shadowsocks_port
     if not shadowsocks_port == None and proxy == 'shadowsocks':
-        ss_traffic = get_bytes_ss(current_user.shadowsocks_port)
+        ss_traffic = get_bytes_ss(shadowsocks_port)
     else:
         ss_traffic = 0
     ss_go_tx = 0
@@ -1695,9 +1929,12 @@ async def status(userid: Optional[int] = Query(None), username: Optional[str] = 
     elif vpn == 'glorytun_udp':
         vpn_traffic_rx = get_bytes('rx', 'gt-udp-tun' + str(userid))
         vpn_traffic_tx = get_bytes('tx', 'gt-udp-tun' + str(userid))
-    elif vpn == 'mlvpn':
-        vpn_traffic_rx = get_bytes('rx', 'mlvpn' + str(userid))
-        vpn_traffic_tx = get_bytes('tx', 'mlvpn' + str(userid))
+    elif vpn == 'mqvpn':
+        vpn_traffic_rx = get_bytes('rx', 'mqvpn0')
+        vpn_traffic_tx = get_bytes('tx', 'mqvpn0')
+    elif vpn == 'mqvpn2':
+        vpn_traffic_rx = get_bytes('rx', 'mqvpn2')
+        vpn_traffic_tx = get_bytes('tx', 'mqvpn2')
     elif vpn == 'dsvpn':
         vpn_traffic_rx = get_bytes('rx', 'dsvpn' + str(userid))
         vpn_traffic_tx = get_bytes('tx', 'dsvpn' + str(userid))
@@ -1723,13 +1960,10 @@ async def status(userid: Optional[int] = Query(None), username: Optional[str] = 
 
 # Get VPS config
 @app.get('/config', summary="Get full server configuration for current user")
-async def config(userid: Optional[int] = Query(None), serial: Optional[str] = Query(None), current_user: User = Depends(get_current_user)):
+async def config(serial: Optional[str] = Query(None), current_user: User = Depends(get_current_user)):
     LOG.debug('Get config...')
-    if not current_user.permissions == "admin":
-        userid = current_user.userid
-    if userid is None:
-        userid = 0
-    username = get_username_from_userid(userid)
+    userid = 0
+    username = PRIMARY_ROUTER_USERNAME
     if not current_user.permissions == "admin" and serial is not None:
         if not check_username_serial(username, serial):
             return {'error': 'False serial number'}
@@ -1742,6 +1976,9 @@ async def config(userid: Optional[int] = Query(None), serial: Optional[str] = Qu
                     omr_config_data = json.load(f)
                 except ValueError as e:
                     omr_config_data = {}
+    router_user = get_user(omr_config_data['users'][0], PRIMARY_ROUTER_USERNAME)
+    if router_user is None:
+        return {'error': 'Primary router user not configured', 'route': 'config'}
     LOG.debug('Get config... shadowsocks')
     proxy = 'shadowsocks'
     if 'proxy' in omr_config_data['users'][0][username]:
@@ -1758,7 +1995,7 @@ async def config(userid: Optional[int] = Query(None), serial: Optional[str] = Qu
     else:
         data = {'server_port': 65101, 'method': 'chacha20'}
     #shadowsocks_port = data["server_port"]
-    shadowsocks_port = current_user.shadowsocks_port
+    shadowsocks_port = router_user.shadowsocks_port
     shadowsocks_key = ''
     if shadowsocks_port is not None:
         if 'port_key' in data:
@@ -1800,9 +2037,9 @@ async def config(userid: Optional[int] = Query(None), serial: Optional[str] = Qu
         shadowsocks_obfs = False
         shadowsocks_obfs_plugin = ''
         shadowsocks_obfs_type = ''
-    shadowsocks_port = current_user.shadowsocks_port
+    shadowsocks_port = router_user.shadowsocks_port
     if not shadowsocks_port == None and proxy == 'shadowsocks':
-        ss_traffic = get_bytes_ss(current_user.shadowsocks_port)
+        ss_traffic = get_bytes_ss(shadowsocks_port)
     else:
         ss_traffic = 0
 
@@ -1892,11 +2129,6 @@ async def config(userid: Optional[int] = Query(None), serial: Optional[str] = Qu
     else:
         iperf3_key = ''
 
-    if os.path.isfile('/etc/pihole/setupVars.conf'):
-        pihole = True
-    else:
-        pihole = False
-
     LOG.debug('Get config... openvpn')
     #if os.path.isfile('/etc/openvpn/server/static.key'):
     #    with open('/etc/openvpn/server/static.key',"rb") as ovpnkey_file:
@@ -1953,27 +2185,114 @@ async def config(userid: Optional[int] = Query(None), serial: Optional[str] = Qu
     softether_host_ip = '10.255.210.1'
     softether_client_ip = 'dhcp'
 
-    LOG.debug('Get config... mlvpn')
-    if os.path.isfile('/etc/mlvpn/mlvpn0.conf'):
-        mlvpn_config = configparser.ConfigParser()
-        mlvpn_config.read_file(open(r'/etc/mlvpn/mlvpn0.conf'))
-        mlvpn_key = mlvpn_config.get('general', 'password').strip('"')
-        mlvpn_timeout = mlvpn_config.get('general', 'timeout')
-        mlvpn_reorder_buffer_size = mlvpn_config.get('general', 'reorder_buffer_size')
-        mlvpn_loss_tolerence = mlvpn_config.get('general', 'loss_tolerence')
-        if mlvpn_config.has_option('general', 'cleartext_data'):
-            mlvpn_cleartext_data = mlvpn_config.get('general', 'cleartext_data')
-        else:
-            mlvpn_cleartext_data = ''
-        available_vpn.append("mlvpn")
-    else:
-        mlvpn_key = ''
-        mlvpn_timeout = ''
-        mlvpn_reorder_buffer_size = ''
-        mlvpn_loss_tolerence = ''
-        mlvpn_cleartext_data = ''
-    mlvpn_host_ip = '10.255.253.1'
-    mlvpn_client_ip = '10.255.253.2'
+    LOG.debug('Get config... mqvpn')
+    mqvpn_key = ''
+    mqvpn_port = '65411'
+    mqvpn_scheduler = 'wlb'
+    mqvpn_cc = 'cubic'
+    mqvpn_mtu = 0
+    mqvpn_outer_packet_size = 1400
+    mqvpn_pmtud = False
+    mqvpn_pmtud_probe_size = 1420
+    mqvpn_log_level = 'info'
+    mqvpn_host_ip = '10.255.249.1'
+    mqvpn_client_ip = '10.255.249.2'
+    if os.path.isfile('/etc/mqvpn/server.conf'):
+        mqvpn_config = configparser.ConfigParser(strict=False)
+        mqvpn_config.optionxform = str
+        mqvpn_config.read_file(open(r'/etc/mqvpn/server.conf'))
+        if mqvpn_config.has_option('Auth', 'Key'):
+            mqvpn_key = mqvpn_config.get('Auth', 'Key')
+        if mqvpn_config.has_option('Interface', 'Listen'):
+            mqvpn_listen = mqvpn_config.get('Interface', 'Listen')
+            if ':' in mqvpn_listen:
+                mqvpn_port = mqvpn_listen.rsplit(':', 1)[1]
+        if mqvpn_config.has_option('Interface', 'Subnet'):
+            try:
+                mqvpn_subnet = IPNetwork(mqvpn_config.get('Interface', 'Subnet'))
+                if mqvpn_subnet.version == 4 and mqvpn_subnet.size >= 4:
+                    mqvpn_host_ip = str(mqvpn_subnet[1])
+                    mqvpn_client_ip = str(mqvpn_subnet[2])
+            except (AddrFormatError, ValueError):
+                LOG.warning('Invalid MQVPN Interface.Subnet; reporting default tunnel IPs')
+        if mqvpn_config.has_option('Multipath', 'Scheduler'):
+            mqvpn_scheduler = mqvpn_config.get('Multipath', 'Scheduler')
+        if mqvpn_config.has_option('Multipath', 'CC'):
+            mqvpn_cc = mqvpn_config.get('Multipath', 'CC')
+        if mqvpn_config.has_option('Interface', 'MTU'):
+            try:
+                mqvpn_mtu = mqvpn_config.getint('Interface', 'MTU')
+            except ValueError:
+                LOG.warning('Invalid MQVPN Interface.MTU; reporting safe default')
+        if mqvpn_config.has_option('Interface', 'LogLevel'):
+            mqvpn_log_level = mqvpn_config.get('Interface', 'LogLevel')
+        if mqvpn_config.has_option('Multipath', 'OuterPacketSize'):
+            try:
+                mqvpn_outer_packet_size = mqvpn_config.getint('Multipath', 'OuterPacketSize')
+            except ValueError:
+                LOG.warning('Invalid MQVPN Multipath.OuterPacketSize; reporting safe default')
+        if mqvpn_config.has_option('Multipath', 'PMTUD'):
+            try:
+                mqvpn_pmtud = mqvpn_config.getboolean('Multipath', 'PMTUD')
+            except ValueError:
+                LOG.warning('Invalid MQVPN Multipath.PMTUD; reporting safe default')
+        if mqvpn_config.has_option('Multipath', 'PMTUDProbeSize'):
+            try:
+                mqvpn_pmtud_probe_size = mqvpn_config.getint('Multipath', 'PMTUDProbeSize')
+            except ValueError:
+                LOG.warning('Invalid MQVPN Multipath.PMTUDProbeSize; reporting safe default')
+        available_vpn.append("mqvpn")
+
+    LOG.debug('Get config... mqvpn2')
+    mqvpn2_key = ''
+    mqvpn2_port = '65412'
+    mqvpn2_scheduler = 'wlb'
+    mqvpn2_cc = 'cubic'
+    mqvpn2_mtu = 0
+    mqvpn2_init_max_path_id = 128
+    mqvpn2_reorder = False
+    mqvpn2_log_level = 'info'
+    mqvpn2_host_ip = '10.255.248.1'
+    mqvpn2_client_ip = '10.255.248.2'
+    if os.path.isfile('/etc/mqvpn2/server.conf'):
+        mqvpn2_config = configparser.ConfigParser(strict=False)
+        mqvpn2_config.optionxform = str
+        mqvpn2_config.read_file(open(r'/etc/mqvpn2/server.conf'))
+        if mqvpn2_config.has_option('Auth', 'Key'):
+            mqvpn2_key = mqvpn2_config.get('Auth', 'Key')
+        if mqvpn2_config.has_option('Interface', 'Listen'):
+            mqvpn2_listen = mqvpn2_config.get('Interface', 'Listen')
+            if ':' in mqvpn2_listen:
+                mqvpn2_port = mqvpn2_listen.rsplit(':', 1)[1]
+        if mqvpn2_config.has_option('Interface', 'Subnet'):
+            try:
+                mqvpn2_subnet = IPNetwork(mqvpn2_config.get('Interface', 'Subnet'))
+                if mqvpn2_subnet.version == 4 and mqvpn2_subnet.size >= 4:
+                    mqvpn2_host_ip = str(mqvpn2_subnet[1])
+                    mqvpn2_client_ip = str(mqvpn2_subnet[2])
+            except (AddrFormatError, ValueError):
+                LOG.warning('Invalid MQVPN2 Interface.Subnet; reporting defaults')
+        if mqvpn2_config.has_option('Multipath', 'Scheduler'):
+            mqvpn2_scheduler = mqvpn2_config.get('Multipath', 'Scheduler')
+        if mqvpn2_config.has_option('Multipath', 'CC'):
+            mqvpn2_cc = mqvpn2_config.get('Multipath', 'CC')
+        if mqvpn2_config.has_option('Interface', 'MTU'):
+            try:
+                mqvpn2_mtu = mqvpn2_config.getint('Interface', 'MTU')
+            except ValueError:
+                LOG.warning('Invalid MQVPN2 Interface.MTU; reporting default')
+        if mqvpn2_config.has_option('Multipath', 'InitMaxPathId'):
+            try:
+                mqvpn2_init_max_path_id = mqvpn2_config.getint(
+                    'Multipath', 'InitMaxPathId')
+            except ValueError:
+                LOG.warning('Invalid MQVPN2 InitMaxPathId; reporting default')
+        if mqvpn2_config.has_option('Reorder', 'Enabled'):
+            mqvpn2_reorder = mqvpn2_config.get(
+                'Reorder', 'Enabled').lower() in ['1', 'true', 'yes', 'on']
+        if mqvpn2_config.has_option('Interface', 'LogLevel'):
+            mqvpn2_log_level = mqvpn2_config.get('Interface', 'LogLevel')
+        available_vpn.append("mqvpn2")
 
     LOG.debug('Get config... wireguard')
     if os.path.isfile('/etc/wireguard/vpn-server-public.key'):
@@ -2012,11 +2331,9 @@ async def config(userid: Optional[int] = Query(None), serial: Optional[str] = Qu
     LOG.debug("Gre tunnels... ?")
     LOG.debug(omr_config_data['users'][0][username])
     if 'gre_tunnels' in omr_config_data['users'][0][username]:
-    #if 'gre_tunnels' in current_user:
         LOG.debug("Gre tunnels...")
         gre_tunnel = True
         gre_tunnel_conf = omr_config_data['users'][0][username]['gre_tunnels']
-        #gre_tunnel_conf = current_user.gre_tunnels
 
     if 'vpnremoteip' in omr_config_data['users'][0][username]:
         vpn_remote_ip = omr_config_data['users'][0][username]['vpnremoteip']
@@ -2112,6 +2429,35 @@ async def config(userid: Optional[int] = Query(None), serial: Optional[str] = Qu
         mptcp_version = '1'
 
     congestion_control = os.popen('sysctl -n net.ipv4.tcp_congestion_control').read().rstrip()
+    nanbbr_var_capabilities = nanbbr_capabilities()
+    nanbbr_aggressiveness = read_nanbbr_aggressiveness()
+    selected_nanbbr_parameter = nanbbr_parameter_path(congestion_control)
+    if selected_nanbbr_parameter and path.exists(selected_nanbbr_parameter):
+        try:
+            with open(selected_nanbbr_parameter, 'r') as parameter_file:
+                runtime_aggressiveness = int(parameter_file.read().strip())
+            if NANBBR_AGGRESSIVENESS_MIN <= runtime_aggressiveness <= NANBBR_AGGRESSIVENESS_MAX:
+                nanbbr_aggressiveness = runtime_aggressiveness
+        except (OSError, ValueError):
+            pass
+    if nanbbr_aggressiveness is None:
+        for nanbbr_cc, capable in nanbbr_var_capabilities.items():
+            if not capable:
+                continue
+            try:
+                with open(nanbbr_parameter_path(nanbbr_cc), 'r') as parameter_file:
+                    runtime_aggressiveness = int(parameter_file.read().strip())
+                if NANBBR_AGGRESSIVENESS_MIN <= runtime_aggressiveness <= NANBBR_AGGRESSIVENESS_MAX:
+                    nanbbr_aggressiveness = runtime_aggressiveness
+                    break
+            except (OSError, ValueError):
+                continue
+    if nanbbr_aggressiveness is None and any(nanbbr_var_capabilities.values()):
+        nanbbr_aggressiveness = 50
+    nanbbr_aggressiveness_capable = nanbbr_var_capabilities.get(
+        congestion_control,
+        any(nanbbr_var_capabilities.values()),
+    )
 
     LOG.debug('Get config... ipv6')
     if 'ipv6_network' in omr_config_data:
@@ -2163,7 +2509,7 @@ async def config(userid: Optional[int] = Query(None), serial: Optional[str] = Qu
         if vps_domain != '':
             set_global_param('hostname', vps_domain)
     #vps_domain = os.popen('dig -4 +short +times=3 +tries=1 -x ' + ipv4_addr + " | sed 's/\.$//'").read().rstrip()
-    user_permissions = current_user.permissions
+    user_permissions = router_user.permissions
 
     internet = True
     if 'internet' in omr_config_data and not omr_config_data['internet']:
@@ -2198,9 +2544,12 @@ async def config(userid: Optional[int] = Query(None), serial: Optional[str] = Qu
     elif vpn == 'glorytun_udp':
         vpn_traffic_rx = get_bytes('rx', 'gt-udp-tun' + str(userid))
         vpn_traffic_tx = get_bytes('tx', 'gt-udp-tun' + str(userid))
-    elif vpn == 'mlvpn':
-        vpn_traffic_rx = get_bytes('rx', 'mlvpn' + str(userid))
-        vpn_traffic_tx = get_bytes('tx', 'mlvpn' + str(userid))
+    elif vpn == 'mqvpn':
+        vpn_traffic_rx = get_bytes('rx', 'mqvpn0')
+        vpn_traffic_tx = get_bytes('tx', 'mqvpn0')
+    elif vpn == 'mqvpn2':
+        vpn_traffic_rx = get_bytes('rx', 'mqvpn2')
+        vpn_traffic_tx = get_bytes('tx', 'mqvpn2')
     elif vpn == 'dsvpn':
         vpn_traffic_rx = get_bytes('rx', 'dsvpn' + str(userid))
         vpn_traffic_tx = get_bytes('tx', 'dsvpn' + str(userid))
@@ -2218,7 +2567,6 @@ async def config(userid: Optional[int] = Query(None), serial: Optional[str] = Qu
         vpn_traffic_rx = vpn_txrx['uplinkBytes']
         vpn_traffic_tx = vpn_txrx['downlinkBytes']
 
-    #vpn = current_user.vpn
     available_proxy = ["shadowsocks", "shadowsocks-go","v2ray","v2ray-vmess","v2ray-socks","v2ray-trojan","xray","xray-vless-reality","xray-vmess","xray-socks","xray-trojan","xray-shadowsocks"]
     if user_permissions == 'ro':
         del available_vpn
@@ -2234,21 +2582,13 @@ async def config(userid: Optional[int] = Query(None), serial: Optional[str] = Qu
     if 'lanips' in omr_config_data['users'][0][username]:
         lanips = omr_config_data['users'][0][username]['lanips']
 
-    alllanips = []
-    client2client = False
-    if 'client2client' in omr_config_data and omr_config_data['client2client']:
-        client2client = True
-        for users in omr_config_data['users'][0]:
-            if 'lanips' in omr_config_data['users'][0][users] and users != username and omr_config_data['users'][0][users]['lanips'][0] not in alllanips:
-                alllanips.append(omr_config_data['users'][0][users]['lanips'][0])
-
     shorewall_redirect = "enable"
     with open('/etc/shorewall/rules', 'r') as f:
         for line in f:
             if '#DNAT		net		vpn:$OMR_ADDR	tcp	1-64999' in line:
                 shorewall_redirect = "disable"
     LOG.debug('Get config: done')
-    return {'vps': {'kernel': vps_kernel, 'machine': vps_machine, 'omr_version': vps_omr_version, 'loadavg': vps_loadavg, 'uptime': vps_uptime, 'aes': vps_aes}, 'lan': {'ips': lanips}, 'shadowsocks': {'traffic': ss_traffic, 'key': shadowsocks_key, 'port': shadowsocks_port, 'method': shadowsocks_method, 'fast_open': shadowsocks_fast_open, 'reuse_port': shadowsocks_reuse_port, 'no_delay': shadowsocks_no_delay, 'mptcp': shadowsocks_mptcp, 'ebpf': shadowsocks_ebpf, 'obfs': shadowsocks_obfs, 'obfs_plugin': shadowsocks_obfs_plugin, 'obfs_type': shadowsocks_obfs_type}, 'glorytun': {'key': glorytun_key, 'udp': {'host_ip': glorytun_udp_host_ip, 'client_ip': glorytun_udp_client_ip}, 'tcp': {'host_ip': glorytun_tcp_host_ip, 'client_ip': glorytun_tcp_client_ip}, 'port': glorytun_port, 'chacha': glorytun_chacha}, 'dsvpn': {'key': dsvpn_key, 'host_ip': dsvpn_host_ip, 'client_ip': dsvpn_client_ip, 'port': dsvpn_port}, 'openvpn': {'key': openvpn_key, 'client_key': openvpn_client_key, 'client_crt': openvpn_client_crt, 'client_ca': openvpn_client_ca, 'host_ip': openvpn_host_ip, 'client_ip': openvpn_client_ip, 'port': openvpn_port, 'cipher': openvpn_cipher},'wireguard': {'key': wireguard_key, 'host_ip': wireguard_host_ip, 'port': wireguard_port, 'client_key': wireguard_client_key, 'client_ip': wireguard_client_ip, 'client_port': wireguard_client_port}, 'mlvpn': {'key': mlvpn_key, 'host_ip': mlvpn_host_ip, 'client_ip': mlvpn_client_ip,'timeout': mlvpn_timeout,'reorder_buffer_size': mlvpn_reorder_buffer_size,'loss_tolerence': mlvpn_loss_tolerence,'cleartext_data': mlvpn_cleartext_data}, 'shorewall': {'redirect_ports': shorewall_redirect}, 'mptcp': {'enabled': mptcp_enabled, 'checksum': mptcp_checksum, 'path_manager': mptcp_path_manager, 'scheduler': mptcp_scheduler, 'syn_retries': mptcp_syn_retries, 'version': mptcp_version}, 'network': {'congestion_control': congestion_control, 'ipv6_network': ipv6_network, 'ipv6': ipv6_addr, 'ipv4': ipv4_addr, 'domain': vps_domain, 'internet': internet}, 'vpn': {'available': available_vpn, 'current': vpn, 'remoteip': vpn_remote_ip, 'localip': vpn_local_ip, 'rx': vpn_traffic_rx, 'tx': vpn_traffic_tx}, 'iperf': {'user': 'openmptcprouter', 'password': 'openmptcprouter', 'key': iperf3_key}, 'pihole': {'state': pihole}, 'user': {'name': username, 'permission': user_permissions}, 'ip6in4': {'localip': localip6, 'remoteip': remoteip6, 'ula': ula}, 'client2client': {'enabled': client2client, 'lanips': alllanips}, 'gre_tunnel': {'enabled': gre_tunnel, 'config': gre_tunnel_conf}, 'v2ray': {'enabled': v2ray, 'config': v2ray_conf, 'tx': v2ray_tx, 'rx': v2ray_rx},'xray': {'enabled': xray, 'config': xray_conf, 'tx': xray_tx, 'rx': xray_rx},'shadowsocks_go': {'enabled': shadowsocks_go, 'config': shadowsocks_go_conf,'tx': ss_go_tx, 'rx': ss_go_rx}, 'proxy': {'available': available_proxy, 'current': proxy}, 'softethervpn': {'enabled': softether, 'port': softether_port, 'password': softether_password, 'cipher': softether_cipher, 'host_ip': softether_host_ip, 'client_ip': softether_client_ip},'localvpn': localvpn}
+    return {'vps': {'kernel': vps_kernel, 'machine': vps_machine, 'omr_version': vps_omr_version, 'loadavg': vps_loadavg, 'uptime': vps_uptime, 'aes': vps_aes}, 'lan': {'ips': lanips}, 'shadowsocks': {'traffic': ss_traffic, 'key': shadowsocks_key, 'port': shadowsocks_port, 'method': shadowsocks_method, 'fast_open': shadowsocks_fast_open, 'reuse_port': shadowsocks_reuse_port, 'no_delay': shadowsocks_no_delay, 'mptcp': shadowsocks_mptcp, 'ebpf': shadowsocks_ebpf, 'obfs': shadowsocks_obfs, 'obfs_plugin': shadowsocks_obfs_plugin, 'obfs_type': shadowsocks_obfs_type}, 'glorytun': {'key': glorytun_key, 'udp': {'host_ip': glorytun_udp_host_ip, 'client_ip': glorytun_udp_client_ip}, 'tcp': {'host_ip': glorytun_tcp_host_ip, 'client_ip': glorytun_tcp_client_ip}, 'port': glorytun_port, 'chacha': glorytun_chacha}, 'dsvpn': {'key': dsvpn_key, 'host_ip': dsvpn_host_ip, 'client_ip': dsvpn_client_ip, 'port': dsvpn_port}, 'openvpn': {'key': openvpn_key, 'client_key': openvpn_client_key, 'client_crt': openvpn_client_crt, 'client_ca': openvpn_client_ca, 'host_ip': openvpn_host_ip, 'client_ip': openvpn_client_ip, 'port': openvpn_port, 'cipher': openvpn_cipher},'wireguard': {'key': wireguard_key, 'host_ip': wireguard_host_ip, 'port': wireguard_port, 'client_key': wireguard_client_key, 'client_ip': wireguard_client_ip, 'client_port': wireguard_client_port}, 'mqvpn': {'key': mqvpn_key, 'host_ip': mqvpn_host_ip, 'client_ip': mqvpn_client_ip, 'port': mqvpn_port, 'scheduler': mqvpn_scheduler, 'cc': mqvpn_cc, 'mtu': mqvpn_mtu, 'outer_packet_size': mqvpn_outer_packet_size, 'pmtud': mqvpn_pmtud, 'pmtud_probe_size': mqvpn_pmtud_probe_size, 'log_level': mqvpn_log_level}, 'mqvpn2': {'key': mqvpn2_key, 'host_ip': mqvpn2_host_ip, 'client_ip': mqvpn2_client_ip, 'port': mqvpn2_port, 'scheduler': mqvpn2_scheduler, 'cc': mqvpn2_cc, 'mtu': mqvpn2_mtu, 'init_max_path_id': mqvpn2_init_max_path_id, 'reorder': mqvpn2_reorder, 'log_level': mqvpn2_log_level}, 'shorewall': {'redirect_ports': shorewall_redirect}, 'mptcp': {'enabled': mptcp_enabled, 'checksum': mptcp_checksum, 'path_manager': mptcp_path_manager, 'scheduler': mptcp_scheduler, 'syn_retries': mptcp_syn_retries, 'version': mptcp_version, 'nanbbr_aggressiveness': nanbbr_aggressiveness, 'nanbbr_aggressiveness_capable': nanbbr_aggressiveness_capable, 'nanbbr_aggressiveness_min': NANBBR_AGGRESSIVENESS_MIN, 'nanbbr_aggressiveness_max': NANBBR_AGGRESSIVENESS_MAX, 'nanbbr_var_capabilities': nanbbr_var_capabilities}, 'network': {'congestion_control': congestion_control, 'ipv6_network': ipv6_network, 'ipv6': ipv6_addr, 'ipv4': ipv4_addr, 'domain': vps_domain, 'internet': internet}, 'vpn': {'available': available_vpn, 'current': vpn, 'remoteip': vpn_remote_ip, 'localip': vpn_local_ip, 'rx': vpn_traffic_rx, 'tx': vpn_traffic_tx}, 'iperf': {'user': PRIMARY_ROUTER_USERNAME, 'password': PRIMARY_ROUTER_USERNAME, 'key': iperf3_key}, 'user': {'name': username, 'permission': user_permissions}, 'ip6in4': {'localip': localip6, 'remoteip': remoteip6, 'ula': ula}, 'gre_tunnel': {'enabled': gre_tunnel, 'config': gre_tunnel_conf}, 'v2ray': {'enabled': v2ray, 'config': v2ray_conf, 'tx': v2ray_tx, 'rx': v2ray_rx},'xray': {'enabled': xray, 'config': xray_conf, 'tx': xray_tx, 'rx': xray_rx},'shadowsocks_go': {'enabled': shadowsocks_go, 'config': shadowsocks_go_conf,'tx': ss_go_tx, 'rx': ss_go_rx}, 'proxy': {'available': available_proxy, 'current': proxy}, 'softethervpn': {'enabled': softether, 'port': softether_port, 'password': softether_password, 'cipher': softether_cipher, 'host_ip': softether_host_ip, 'client_ip': softether_client_ip},'localvpn': localvpn}
 
 # Set shadowsocks config
 class OBFSPLUGIN(str, Enum):
@@ -2317,10 +2657,8 @@ def shadowsocks(*, params: ShadowsocksConfigparams, current_user: User = Depends
         portconf = data["port_conf"]
         portconf[str(port)]['key'] = key
     LOG.debug("modif_config_user for shadowsocks_port")
-    modif_config_user(current_user.username, {'shadowsocks_port': port})
-    userid = current_user.userid
-    if userid is None:
-        userid = 0
+    modif_config_user(PRIMARY_ROUTER_USERNAME, {'shadowsocks_port': port})
+    userid = 0
     with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
         try:
             omr_config_data = json.load(f)
@@ -2427,8 +2765,9 @@ def shadowsocks(*, params: ShadowsocksConfigparams, current_user: User = Depends
         os.system("systemctl -q restart shadowsocks-libev-manager@manager.service")
         #for x in range(1, os.cpu_count()):
         #    os.system("systemctl restart shadowsocks-libev-manager@manager" + str(x) + ".service")
-        shorewall_add_port(current_user, str(port), 'tcp', 'shadowsocks')
-        shorewall_add_port(current_user, str(port), 'udp', 'shadowsocks')
+        router_user = get_primary_router_user()
+        shorewall_add_port(router_user, str(port), 'tcp', 'shadowsocks')
+        shorewall_add_port(router_user, str(port), 'udp', 'shadowsocks')
         #set_lastchange()
         return {'result': 'done', 'reason': 'changes applied', 'route': 'shadowsocks'}
     else:
@@ -2469,14 +2808,12 @@ def shadowsocks_go(*, params: ShadowsocksGoConfigparams, current_user: User = De
     #key = params.key
     LOG.debug("modif_config_user for shadowsocks-go port")
     shadowsocks_go_psk = os.popen("jq -r '.servers[] | select(.name==" + '"ss-2022"' + ") | .psk' /etc/shadowsocks-go/server.json").read().rstrip()
-    shadowsocks_go_upsk = os.popen("jq -r --arg user " + '"' + current_user.username + '"' + " '.[$user]' /etc/shadowsocks-go/upsks.json").read().rstrip()
+    shadowsocks_go_upsk = os.popen("jq -r --arg user " + '"' + PRIMARY_ROUTER_USERNAME + '"' + " '.[$user]' /etc/shadowsocks-go/upsks.json").read().rstrip()
     shadowsocks_go_conf= { 'password': shadowsocks_go_psk + ':' + shadowsocks_go_upsk, 'port': port, 'protocol': method }
-    modif_config_user(current_user.username, {'shadowsocks-go': shadowsocks_go_conf})
+    modif_config_user(PRIMARY_ROUTER_USERNAME, {'shadowsocks-go': shadowsocks_go_conf})
 
-    modif_config_user(current_user.username, {'shadowsocks-go': {'port': port,'method': method}})
-    userid = current_user.userid
-    if userid is None:
-        userid = 0
+    modif_config_user(PRIMARY_ROUTER_USERNAME, {'shadowsocks-go': {'port': port,'method': method}})
+    userid = 0
     data["servers"][0]["tcpListeners"][0]["address"] = ":" + str(port)
     data["servers"][0]["tcpListeners"][0]["fastOpen"] = fast_open
     data["servers"][0]["listenerTFO"] = fast_open
@@ -2489,8 +2826,9 @@ def shadowsocks_go(*, params: ShadowsocksGoConfigparams, current_user: User = De
     final_md5 = hashlib.md5(file_as_bytes(open('/etc/shadowsocks-go/server.json', 'rb'))).hexdigest()
     if initial_md5 != final_md5:
         os.system("systemctl -q restart shadowsocks-go.service")
-        shorewall_add_port(current_user, str(port), 'tcp', 'shadowsocks-go')
-        shorewall_add_port(current_user, str(port), 'udp', 'shadowsocks-go')
+        router_user = get_primary_router_user()
+        shorewall_add_port(router_user, str(port), 'tcp', 'shadowsocks-go')
+        shorewall_add_port(router_user, str(port), 'udp', 'shadowsocks-go')
         #set_lastchange()
         return {'result': 'done', 'reason': 'changes applied', 'route': 'shadowsocks-go'}
     else:
@@ -2568,12 +2906,12 @@ def shorewall_list(*, params: ShorewallListparams, current_user: User = Depends(
     if params.ipproto == 'ipv4':
         with open('/etc/shorewall/rules', 'r') as f:
             for line in f:
-                if '# OMR ' + current_user.username + ' ' + name in line:
+                if '# OMR ' + PRIMARY_ROUTER_USERNAME + ' ' + name in line:
                     fwlist.append(line)
     else:
         with open('/etc/shorewall6/rules', 'r') as f:
             for line in f:
-                if '# OMR ' + current_user.username + ' ' + name in line:
+                if '# OMR ' + PRIMARY_ROUTER_USERNAME + ' ' + name in line:
                     fwlist.append(line)
     return {'list': fwlist}
 
@@ -2585,6 +2923,7 @@ class Shorewallparams(BaseModel):
     ipproto: IPPROTO = Query("ipv4", title="Protocol IP for changes")
     source_dip: str = ""
     source_ip: str = ""
+    dest_port: str = ""
     comment: str = ""
 
 @app.post('/shorewallopen', summary="Redirect a port from Server to Router")
@@ -2602,27 +2941,25 @@ def shorewall_open(*, params: Shorewallparams, current_user: User = Depends(get_
     fwtype = params.fwtype
     source_dip = params.source_dip
     source_ip = params.source_ip
+    dest_port = params.dest_port
     comment = params.comment
     if comment != '':
         comment = ' --- ' + comment
     vpn = "default"
-    username = current_user.username
+    username = PRIMARY_ROUTER_USERNAME
     if name is None:
         return {'result': 'error', 'reason': 'Invalid parameters', 'route': 'shorewallopen'}
     #proxy = 'shadowsocks'
     #if 'proxy' in omr_config_data['users'][0][username]:
     #    proxy = omr_config_data['users'][0][username]['proxy']
-    #if proxy == 'v2ray':
-    #    v2ray_add_port(current_user, str(port), proto, name)
-    #    fwtype = 'ACCEPT'
     if params.ipproto == 'ipv4':
-        if 'gre_tunnels' in omr_config_data['users'][0][current_user.username]:
-            for tunnel in omr_config_data['users'][0][current_user.username]['gre_tunnels']:
-                if omr_config_data['users'][0][current_user.username]['gre_tunnels'][tunnel]['public_ip'] == source_dip:
-                    vpn = omr_config_data['users'][0][current_user.username]['gre_tunnels'][tunnel]['remote_ip']
-        shorewall_add_port(current_user, str(port), proto, name, fwtype, source_dip, source_ip, vpn, comment)
+        if 'gre_tunnels' in omr_config_data['users'][0][PRIMARY_ROUTER_USERNAME]:
+            for tunnel in omr_config_data['users'][0][PRIMARY_ROUTER_USERNAME]['gre_tunnels']:
+                if omr_config_data['users'][0][PRIMARY_ROUTER_USERNAME]['gre_tunnels'][tunnel]['public_ip'] == source_dip:
+                    vpn = omr_config_data['users'][0][PRIMARY_ROUTER_USERNAME]['gre_tunnels'][tunnel]['remote_ip']
+        shorewall_add_port(get_primary_router_user(), str(port), proto, name, fwtype, source_dip, source_ip, vpn, comment, dest_port)
     else:
-        shorewall6_add_port(current_user, str(port), proto, name, fwtype, source_dip, source_ip, comment)
+        shorewall6_add_port(get_primary_router_user(), str(port), proto, name, fwtype, source_dip, source_ip, comment, dest_port)
     return {'result': 'done', 'reason': 'changes applied'}
 
 @app.post('/shorewallclose', summary="Remove a redirected port")
@@ -2640,13 +2977,12 @@ def shorewall_close(*, params: Shorewallparams, current_user: User = Depends(get
         comment = ' --- ' + comment
     if name is None:
         return {'result': 'error', 'reason': 'Invalid parameters', 'route': 'shorewallclose'}
-    #v2ray_del_port(current_user.username, str(port), proto, name)
     if params.ipproto == 'ipv4':
-        shorewall_del_port(current_user.username, str(port), proto, name, 'DNAT', source_dip, source_ip, comment)
-        shorewall_del_port(current_user.username, str(port), proto, name, 'ACCEPT', source_dip, source_ip, comment)
+        shorewall_del_port(PRIMARY_ROUTER_USERNAME, str(port), proto, name, 'DNAT', source_dip, source_ip, comment)
+        shorewall_del_port(PRIMARY_ROUTER_USERNAME, str(port), proto, name, 'ACCEPT', source_dip, source_ip, comment)
     else:
-        shorewall6_del_port(current_user.username, str(port), proto, name, 'DNAT', source_dip, source_ip, comment)
-        shorewall6_del_port(current_user.username, str(port), proto, name, 'ACCEPT', source_dip, source_ip, comment)
+        shorewall6_del_port(PRIMARY_ROUTER_USERNAME, str(port), proto, name, 'DNAT', source_dip, source_ip, comment)
+        shorewall6_del_port(PRIMARY_ROUTER_USERNAME, str(port), proto, name, 'ACCEPT', source_dip, source_ip, comment)
     return {'result': 'done', 'reason': 'changes applied', 'route': 'shorewallclose'}
 
 class SipALGparams(BaseModel):
@@ -2680,7 +3016,7 @@ def sipalg(*, params: SipALGparams, current_user: User = Depends(get_current_use
     return {'result': 'done', 'reason': 'changes applied', 'route': 'sipalg'}
 
 class V2rayconfig(BaseModel):
-    userid: str
+    pass
 
 @app.post('/v2ray', summary="Set v2ray settings")
 def v2ray(*, params: V2rayconfig, current_user: User = Depends(get_current_user)):
@@ -2690,15 +3026,7 @@ def v2ray(*, params: V2rayconfig, current_user: User = Depends(get_current_user)
         return {'result': 'warning', 'reason': 'V2Ray not installed', 'route': 'v2ray'}
 
     initial_md5 = hashlib.md5(file_as_bytes(open('/etc/v2ray/v2ray-server.json', 'rb'))).hexdigest()
-    #with open('/etc/v2ray/v2ray-server.json') as f:
-    #    v2ray_config = json.load(f)
-    #v2ruserid = params.userid
-    #for inbounds in v2ray_config['inbounds']:
-    #    if inbounds['tag'] == 'omrin-tunnel':
-    #        inbounds['settings']['clients'][0]['id'] = v2ruserid
-    #with open('/etc/v2ray/v2ray-server.json', 'w') as outfile:
-    #    json.dump(v2ray_config, outfile, indent=4)
-    username = current_user.username
+    username = PRIMARY_ROUTER_USERNAME
     final_md5 = hashlib.md5(file_as_bytes(open('/etc/v2ray/v2ray-server.json', 'rb'))).hexdigest()
     v2ray_key = os.popen("jq -r '.inbounds[0].settings.clients[] | select(.email==" + '"' + username + '"' + ") | .id' /etc/v2ray/v2ray-server.json").read().rstrip()
     v2ray_port = os.popen('jq -r .inbounds[0].port /etc/v2ray/v2ray-server.json').read().rstrip()
@@ -2718,7 +3046,6 @@ class XRAYTRANSPORT(str, Enum):
     xhttp = "xhttp"
 
 class Xrayconfig(BaseModel):
-    userid: str
     vless_reality: bool = Query(False, title="Enable or disable VLESS Reality")
     ss_method: str = "2022-blake3-aes-256-gcm"
     transport: XRAYTRANSPORT = Query("tcp", title="Choose transport")
@@ -2747,21 +3074,16 @@ def xray(*, params: Xrayconfig, current_user: User = Depends(get_current_user)):
                 if inbounds['tag'] == 'omrin-vless-reality':
                     xray_config['inbounds'].remove(inbounds)
         for inbounds in xray_config['inbounds']:
+            if inbounds.get('tag', '').startswith('omr-rpf-'):
+                continue
             if inbounds['tag'] == 'omrin-shadowsocks-tunnel':
                 inbounds['settings']['method'] = params.ss_method
-            inbounds['streamSettings']['network'] = params.transport
+            if 'streamSettings' in inbounds:
+                inbounds['streamSettings']['network'] = params.transport
 
     with open('/etc/xray/xray-server.json', 'w') as outfile:
         json.dump(xray_config, outfile, indent=4)
-    #with open('/etc/xray/xray-server.json') as f:
-    #    xray_config = json.load(f)
-    #xruserid = params.userid
-    #for inbounds in xray_config['inbounds']:
-    #    if inbounds['tag'] == 'omrin-tunnel':
-    #        inbounds['settings']['clients'][0]['id'] = xruserid
-    #with open('/etc/xray/xray-server.json', 'w') as outfile:
-    #    json.dump(xray_config, outfile, indent=4)
-    username = current_user.username
+    username = PRIMARY_ROUTER_USERNAME
     final_md5 = hashlib.md5(file_as_bytes(open('/etc/xray/xray-server.json', 'rb'))).hexdigest()
     xray_key = os.popen("jq -r '.inbounds[0].settings.clients[] | select(.email==" + '"' + username + '"' + ") | .id' /etc/xray/xray-server.json").read().rstrip()
     xray_ss_skey = os.popen("jq -r '.inbounds[] | select(.tag==" + '"' + 'omrin-shadowsocks-tunnel' + '"' + ") | .settings.password' /etc/xray/xray-server.json").read().rstrip()
@@ -2780,9 +3102,9 @@ def xray(*, params: Xrayconfig, current_user: User = Depends(get_current_user)):
         modif_config_user(username, {'xray': xray_conf})
     if initial_md5 != final_md5:
         if params.vless_reality and not chk_vless_reality:
-            shorewall_add_port(current_user, '443', 'tcp', 'xray vless-reality')
+            shorewall_add_port(get_primary_router_user(), '443', 'tcp', 'xray vless-reality')
         elif not params.vless_reality and chk_vless_reality:
-            shorewall_del_port(current_user.username, '443', 'tcp', 'xray vless-reality')
+            shorewall_del_port(PRIMARY_ROUTER_USERNAME, '443', 'tcp', 'xray vless-reality')
         os.system("systemctl -q restart xray")
         #set_lastchange()
         return {'result': 'done', 'reason': 'changes applied', 'route': 'xray'}
@@ -2813,10 +3135,10 @@ def v2ray_redirect(*, params: V2rayparams, current_user: User = Depends(get_curr
     proto = params.proto
     destip = params.destip
     destport = params.destport
-    username = current_user.username
+    username = PRIMARY_ROUTER_USERNAME
     if name is None:
         return {'result': 'error', 'reason': 'Invalid parameters', 'route': 'v2rayredirect'}
-    v2ray_add_port(current_user, port, proto, name, destip, destport)
+    v2ray_add_port(get_primary_router_user(), port, proto, name, destip, destport)
     return {'result': 'done', 'reason': 'changes applied'}
 
 class Xrayparams(BaseModel):
@@ -2843,11 +3165,26 @@ def xray_redirect(*, params: Xrayparams, current_user: User = Depends(get_curren
     proto = params.proto
     destip = params.destip
     destport = params.destport
-    username = current_user.username
+    username = PRIMARY_ROUTER_USERNAME
     if name is None:
         return {'result': 'error', 'reason': 'Invalid parameters', 'route': 'xrayredirect'}
-    xray_add_port(current_user, port, proto, name, destip, destport)
+    xray_add_port(get_primary_router_user(), port, proto, name, destip, destport)
     return {'result': 'done', 'reason': 'changes applied'}
+
+@app.post('/xrayrpfredirect', summary="Redirect a TCP port from Server to Router with XRay reverse")
+def xray_rpf_redirect(*, params: Xrayparams, current_user: User = Depends(get_current_user)):
+    if current_user.permissions == "ro":
+        return {'result': 'permission', 'reason': 'Read only user', 'route': 'xrayrpfredirect'}
+    if not os.path.isfile('/etc/xray/xray-server.json'):
+        return {'result': 'warning', 'reason': 'XRay not installed', 'route': 'xrayrpfredirect'}
+    name = params.name
+    port = params.port
+    proto = params.proto
+    destip = params.destip
+    destport = params.destport
+    if name is None:
+        return {'result': 'error', 'reason': 'Invalid parameters', 'route': 'xrayrpfredirect'}
+    return xray_rpf_add_port(get_primary_router_user(), port, proto, name, destip, destport)
 
 @app.post('/v2rayunredirect', summary="Remove a redirected port from Server to Router with V2Ray")
 def v2ray_unredirect(*, params: V2rayparams, current_user: User = Depends(get_current_user)):
@@ -2865,10 +3202,10 @@ def v2ray_unredirect(*, params: V2rayparams, current_user: User = Depends(get_cu
     proto = params.proto
     destip = params.destip
     destport = params.destport
-    username = current_user.username
+    username = PRIMARY_ROUTER_USERNAME
     if name is None:
         return {'result': 'error', 'reason': 'Invalid parameters', 'route': 'v2rayunredirect'}
-    v2ray_del_port(current_user, port, proto, name, destip, destport)
+    v2ray_del_port(get_primary_router_user(), port, proto, name, destip, destport)
     return {'result': 'done', 'reason': 'changes applied'}
 
 @app.post('/xrayunredirect', summary="Remove a redirected port from Server to Router with XRay")
@@ -2887,11 +3224,26 @@ def xray_unredirect(*, params: Xrayparams, current_user: User = Depends(get_curr
     proto = params.proto
     destip = params.destip
     destport = params.destport
-    username = current_user.username
+    username = PRIMARY_ROUTER_USERNAME
     if name is None:
         return {'result': 'error', 'reason': 'Invalid parameters', 'route': 'xrayunredirect'}
-    xray_del_port(current_user, port, proto, name, destip, destport)
+    xray_del_port(get_primary_router_user(), port, proto, name, destip, destport)
     return {'result': 'done', 'reason': 'changes applied'}
+
+@app.post('/xrayrpfunredirect', summary="Remove an XRay reverse redirected port")
+def xray_rpf_unredirect(*, params: Xrayparams, current_user: User = Depends(get_current_user)):
+    if current_user.permissions == "ro":
+        return {'result': 'permission', 'reason': 'Read only user', 'route': 'xrayrpfunredirect'}
+    if not os.path.isfile('/etc/xray/xray-server.json'):
+        return {'result': 'warning', 'reason': 'XRay not installed', 'route': 'xrayrpfunredirect'}
+    name = params.name
+    port = params.port
+    proto = params.proto
+    destip = params.destip
+    destport = params.destport
+    if name is None:
+        return {'result': 'error', 'reason': 'Invalid parameters', 'route': 'xrayrpfunredirect'}
+    return xray_rpf_del_port(get_primary_router_user(), port, proto, name, destip, destport)
 
 # Set MPTCP config
 class MPTCPparams(BaseModel):
@@ -2901,6 +3253,11 @@ class MPTCPparams(BaseModel):
     syn_retries: int
     congestion_control: str
     version: int = 0
+    nanbbr_aggressiveness: Optional[int] = Query(
+        None,
+        ge=NANBBR_AGGRESSIVENESS_MIN,
+        le=NANBBR_AGGRESSIVENESS_MAX,
+    )
 
 @app.post('/mptcp', summary="Modify MPTCP configuration of the server")
 def mptcp(*, params: MPTCPparams, current_user: User = Depends(get_current_user)):
@@ -2913,34 +3270,212 @@ def mptcp(*, params: MPTCPparams, current_user: User = Depends(get_current_user)
     syn_retries = params.syn_retries
     congestion_control = params.congestion_control
     version = params.version
+    nanbbr_aggressiveness = params.nanbbr_aggressiveness
     if not checksum or not path_manager or not scheduler or not syn_retries or not congestion_control:
         return {'result': 'error', 'reason': 'Invalid parameters', 'route': 'mptcp'}
-    if path.exists('/proc/sys/net/mptcp/mptcp_enabled'):
-        os.system('sysctl -qw net.mptcp.mptcp_checksum=' + checksum)
-        os.system('sysctl -qw net.mptcp.mptcp_path_manager=' + path_manager)
-        os.system('sysctl -qw net.mptcp.mptcp_scheduler=' + scheduler)
-        os.system('sysctl -qw net.mptcp.mptcp_syn_retries=' + str(syn_retries))
-        os.system('sysctl -qw net.mptcp.mptcp_version=' + str(version))
-    else:
-        os.system('sysctl -qw net.mptcp.checksum_enabled=' + checksum)
-    os.system('sysctl -qw net.ipv4.tcp_congestion_control=' + congestion_control)
-    initial_md5 = hashlib.md5(file_as_bytes(open('/etc/sysctl.d/90-shadowsocks.conf', 'rb'))).hexdigest()
-    fd, tmpfile = mkstemp()
-    with open('/etc/sysctl.d/90-shadowsocks.conf', 'r') as f, open(tmpfile, 'a+') as n:
-        for line in f:
-            if not 'net.mptcp' in line and not 'net.ipv4.tcp_congestion_control' in line:
-                n.write(line)
-        n.write('net.mptcp.mptcp_checksum=' + checksum + "\n")
-        n.write('net.mptcp.mptcp_path_manager=' + path_manager + "\n")
-        n.write('net.mptcp.mptcp_scheduler=' + scheduler + "\n")
-        n.write('net.mptcp.mptcp_syn_retries=' + str(syn_retries) + "\n")
-        n.write('net.mptcp.mptcp_version=' + str(version) + "\n")
-        n.write('net.mptcp.checksum_enabled=' + checksum + "\n")
-        n.write('net.ipv4.tcp_congestion_control=' + congestion_control + "\n")
-    os.close(fd)
-    move(tmpfile, '/etc/sysctl.d/90-shadowsocks.conf')
-    final_md5 = hashlib.md5(file_as_bytes(open('/etc/sysctl.d/90-shadowsocks.conf', 'rb'))).hexdigest()
-    if initial_md5 != final_md5:
+    if checksum not in ['0', '1'] or not 1 <= syn_retries <= 255 or version not in [0, 1]:
+        return {'result': 'error', 'reason': 'Invalid MPTCP numeric parameters', 'route': 'mptcp'}
+    safe_name = re.compile(r'^[A-Za-z0-9_.-]+$')
+    if not safe_name.fullmatch(path_manager) or not safe_name.fullmatch(scheduler) or not safe_name.fullmatch(congestion_control):
+        return {'result': 'error', 'reason': 'Invalid MPTCP setting name', 'route': 'mptcp'}
+    if congestion_control in NANBBR_VAR_MODULES and nanbbr_aggressiveness is None:
+        return {
+            'result': 'error',
+            'reason': 'nanbbr_aggressiveness is required for NanBBR var',
+            'route': 'mptcp',
+        }
+
+    os.makedirs(path.dirname(MPTCP_LOCK_FILE), exist_ok=True)
+    with open(MPTCP_LOCK_FILE, 'a+', encoding='ascii') as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        nanbbr_parameters = {}
+        if nanbbr_aggressiveness is not None:
+            for nanbbr_cc in NANBBR_VAR_MODULES:
+                try:
+                    nanbbr_parameters[nanbbr_cc] = ensure_nanbbr_parameter(nanbbr_cc)
+                except RuntimeError:
+                    if nanbbr_cc == congestion_control:
+                        return {
+                            'result': 'error',
+                            'reason': 'NanBBR var aggressiveness is not supported',
+                            'route': 'mptcp',
+                        }
+            if not nanbbr_parameters:
+                return {
+                    'result': 'error',
+                    'reason': 'NanBBR var aggressiveness is not supported',
+                    'route': 'mptcp',
+                }
+
+        try:
+            with open('/proc/sys/net/ipv4/tcp_available_congestion_control') as cc_file:
+                available_cc = cc_file.read().split()
+        except OSError:
+            available_cc = []
+        if available_cc and congestion_control not in available_cc:
+            return {'result': 'error', 'reason': 'Congestion control is not available', 'route': 'mptcp'}
+
+        sysctl_values = []
+        if path.exists('/proc/sys/net/mptcp/mptcp_enabled'):
+            sysctl_values.extend([
+                ('net.mptcp.mptcp_checksum', checksum),
+                ('net.mptcp.mptcp_path_manager', path_manager),
+                ('net.mptcp.mptcp_scheduler', scheduler),
+                ('net.mptcp.mptcp_syn_retries', syn_retries),
+                ('net.mptcp.mptcp_version', version),
+            ])
+        else:
+            sysctl_values.append(('net.mptcp.checksum_enabled', checksum))
+        sysctl_values.append(('net.ipv4.tcp_congestion_control', congestion_control))
+
+        old_sysctl_values = {}
+        old_nanbbr_values = {}
+        applied_sysctls = []
+        applied_nanbbr_parameters = []
+        restored_files = []
+        shadowsocks_file = '/etc/sysctl.d/90-shadowsocks.conf'
+        try:
+            with open(shadowsocks_file, 'rb') as config_file:
+                old_shadowsocks_content = config_file.read()
+            try:
+                with open(NANBBR_CONFIG_FILE, 'rb') as config_file:
+                    old_nanbbr_content = config_file.read()
+            except FileNotFoundError:
+                old_nanbbr_content = None
+
+            for key, unused_value in sysctl_values:
+                result = subprocess.run(
+                    ['sysctl', '-n', key],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                old_sysctl_values[key] = result.stdout.strip()
+            for parameter in nanbbr_parameters.values():
+                with open(parameter, 'r') as parameter_file:
+                    old_nanbbr_values[parameter] = parameter_file.read().strip()
+
+            old_lines = old_shadowsocks_content.decode('utf-8').splitlines(keepends=True)
+            new_lines = [
+                line for line in old_lines
+                if 'net.mptcp' not in line and 'net.ipv4.tcp_congestion_control' not in line
+            ]
+            new_lines.extend([
+                'net.mptcp.mptcp_checksum=' + checksum + "\n",
+                'net.mptcp.mptcp_path_manager=' + path_manager + "\n",
+                'net.mptcp.mptcp_scheduler=' + scheduler + "\n",
+                'net.mptcp.mptcp_syn_retries=' + str(syn_retries) + "\n",
+                'net.mptcp.mptcp_version=' + str(version) + "\n",
+                'net.mptcp.checksum_enabled=' + checksum + "\n",
+                'net.ipv4.tcp_congestion_control=' + congestion_control + "\n",
+            ])
+            new_shadowsocks_content = ''.join(new_lines).encode('utf-8')
+
+            for key, value in sysctl_values[:-1]:
+                applied_sysctls.append(key)
+                subprocess.run(
+                    ['sysctl', '-qw', key + '=' + str(value)],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                readback = subprocess.run(
+                    ['sysctl', '-n', key],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout.strip()
+                if readback != str(value):
+                    raise RuntimeError(key + ' readback mismatch')
+
+            if nanbbr_aggressiveness is not None:
+                for parameter in nanbbr_parameters.values():
+                    applied_nanbbr_parameters.append(parameter)
+                    with open(parameter, 'w') as parameter_file:
+                        parameter_file.write(str(nanbbr_aggressiveness))
+                    with open(parameter, 'r') as parameter_file:
+                        readback = parameter_file.read().strip()
+                    if readback != str(nanbbr_aggressiveness):
+                        raise RuntimeError(parameter + ' readback mismatch')
+
+            cc_key, cc_value = sysctl_values[-1]
+            applied_sysctls.append(cc_key)
+            subprocess.run(
+                ['sysctl', '-qw', cc_key + '=' + str(cc_value)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            readback = subprocess.run(
+                ['sysctl', '-n', cc_key],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            if readback != str(cc_value):
+                raise RuntimeError(cc_key + ' readback mismatch')
+
+            if nanbbr_aggressiveness is not None:
+                new_nanbbr_content = nanbbr_config_content(nanbbr_aggressiveness)
+                if old_nanbbr_content != new_nanbbr_content:
+                    restored_files.append(NANBBR_CONFIG_FILE)
+                    atomic_write_file(NANBBR_CONFIG_FILE, new_nanbbr_content)
+            if old_shadowsocks_content != new_shadowsocks_content:
+                restored_files.append(shadowsocks_file)
+                atomic_write_file(shadowsocks_file, new_shadowsocks_content)
+        except (OSError, UnicodeError, subprocess.SubprocessError, RuntimeError) as error:
+            rollback_errors = []
+            for key in reversed(applied_sysctls):
+                try:
+                    subprocess.run(
+                        ['sysctl', '-qw', key + '=' + old_sysctl_values[key]],
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                    )
+                    restored_value = subprocess.run(
+                        ['sysctl', '-n', key],
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                    ).stdout.strip()
+                    if restored_value != old_sysctl_values[key]:
+                        rollback_errors.append(key + ' rollback readback mismatch')
+                except (OSError, subprocess.SubprocessError) as rollback_error:
+                    rollback_errors.append(str(rollback_error))
+            for parameter in reversed(applied_nanbbr_parameters):
+                try:
+                    with open(parameter, 'w') as parameter_file:
+                        parameter_file.write(old_nanbbr_values[parameter])
+                    with open(parameter, 'r') as parameter_file:
+                        restored_value = parameter_file.read().strip()
+                    if restored_value != old_nanbbr_values[parameter]:
+                        rollback_errors.append(parameter + ' rollback readback mismatch')
+                except OSError as rollback_error:
+                    rollback_errors.append(str(rollback_error))
+            if shadowsocks_file in restored_files:
+                try:
+                    atomic_write_file(shadowsocks_file, old_shadowsocks_content)
+                except OSError as rollback_error:
+                    rollback_errors.append(str(rollback_error))
+            if NANBBR_CONFIG_FILE in restored_files:
+                try:
+                    if old_nanbbr_content is None:
+                        try:
+                            os.remove(NANBBR_CONFIG_FILE)
+                        except FileNotFoundError:
+                            pass
+                    else:
+                        atomic_write_file(NANBBR_CONFIG_FILE, old_nanbbr_content)
+                except OSError as rollback_error:
+                    rollback_errors.append(str(rollback_error))
+            reason = 'Unable to apply MPTCP configuration: ' + str(error)
+            if rollback_errors:
+                reason += '; rollback incomplete'
+            LOG.error(reason)
+            return {'result': 'error', 'reason': reason, 'route': 'mptcp'}
+
+    if old_shadowsocks_content != new_shadowsocks_content:
         if os.path.isfile('/etc/shadowsocks-libev/manager.json'):
             os.system("systemctl -q restart shadowsocks-libev-manager@manager")
         if os.path.isfile('/etc/v2ray/v2ray-server.json'):
@@ -2960,7 +3495,8 @@ class VPN(str, Enum):
     glorytuntcp = "glorytun_tcp"
     glorytunudp = "glorytun_udp"
     dsvpn = "dsvpn"
-    mlvpn = "mlvpn"
+    mqvpn = "mqvpn"
+    mqvpn2 = "mqvpn2"
     softether = "softether"
     none = "none"
 
@@ -2978,8 +3514,7 @@ def vpn(*, vpnconfig: Vpn, current_user: User = Depends(get_current_user)):
         return {'result': 'error', 'reason': 'Invalid parameters', 'route': 'vpn'}
     os.system('echo ' + vpn + ' > /etc/openmptcprouter-vps-admin/current-vpn')
     LOG.debug("modif_config_user for vpn setting")
-    modif_config_user(current_user.username, {'vpn': vpn})
-    current_user.vpn = vpn
+    modif_config_user(PRIMARY_ROUTER_USERNAME, {'vpn': vpn})
     #set_lastchange()
     return {'result': 'done', 'reason': 'changes applied'}
 
@@ -3014,8 +3549,7 @@ def proxy(*, proxyconfig: Proxy, current_user: User = Depends(get_current_user))
         return {'result': 'error', 'reason': 'Invalid parameters', 'route': 'proxy'}
     os.system('echo ' + proxy + ' > /etc/openmptcprouter-vps-admin/current-proxy')
     LOG.debug("modif_config_user for proxy")
-    modif_config_user(current_user.username, {'proxy': proxy})
-    #current_user.proxy = proxy
+    modif_config_user(PRIMARY_ROUTER_USERNAME, {'proxy': proxy})
     #set_lastchange()
     return {'result': 'done', 'reason': 'changes applied'}
 
@@ -3034,9 +3568,7 @@ def glorytun(*, glorytunconfig: GlorytunConfig, current_user: User = Depends(get
     if not os.path.isfile('/etc/glorytun-tcp/tun0') and not os.path.isfile('/etc/glorytun-udp/tun0'):
         return {'result': 'warning', 'reason': 'Glorytun is not installed', 'route': 'glorytun'}
 
-    userid = current_user.userid
-    if userid is None:
-        userid = 0
+    userid = 0
     key = glorytunconfig.key
     port = glorytunconfig.port
     chacha = glorytunconfig.chacha
@@ -3080,8 +3612,9 @@ def glorytun(*, glorytunconfig: GlorytunConfig, current_user: User = Depends(get
     final_md5 = hashlib.md5(file_as_bytes(open('/etc/glorytun-udp/tun' + str(userid), 'rb'))).hexdigest()
     if initial_md5 != final_md5:
         os.system("systemctl -q restart glorytun-udp@tun" + str(userid))
-    shorewall_add_port(current_user, str(port), 'tcp', 'glorytun')
-    shorewall_add_port(current_user, str(port), 'udp', 'glorytun')
+    router_user = get_primary_router_user()
+    shorewall_add_port(router_user, str(port), 'tcp', 'glorytun')
+    shorewall_add_port(router_user, str(port), 'udp', 'glorytun')
     #set_lastchange()
     return {'result': 'done'}
 
@@ -3097,9 +3630,7 @@ def dsvpn(*, params: DSVPN, current_user: User = Depends(get_current_user)):
         return {'result': 'permission', 'reason': 'Read only user', 'route': 'dsvpn'}
     if not os.path.isfile('/etc/dsvpn/dsvpn'):
         return {'result': 'warning', 'reason': 'DSVPN is not installed', 'route': 'dsvpn'}
-    userid = current_user.userid
-    if userid is None:
-        userid = 0
+    userid = 0
     key = params.key
     port = params.port
     if not key or port is None:
@@ -3121,40 +3652,130 @@ def dsvpn(*, params: DSVPN, current_user: User = Depends(get_current_user)):
     final_md5 = hashlib.md5(file_as_bytes(open('/etc/dsvpn/dsvpn' + str(userid) + '.key', 'rb'))).hexdigest()
     if initial_md5 != final_md5:
         os.system("systemctl -q restart dsvpn-server@dsvpn" + str(userid))
-    shorewall_add_port(current_user, str(port), 'tcp', 'dsvpn')
+    shorewall_add_port(get_primary_router_user(), str(port), 'tcp', 'dsvpn')
     #set_lastchange()
     return {'result': 'done'}
 
-# Set MLVPN config
-class MLVPN(BaseModel):
-    timeout: int
-    reorder_buffer_size: int
-    loss_tolerence: int
-    cleartext_data: int
-    password: str
+# Set MQVPN config
+class MQVPN(BaseModel):
+    key: str
+    port: int = Query(65411, gt=0, lt=65535)
+    scheduler: str = "wlb"
+    cc: str = "cubic"
+    mtu: int = 0
+    outer_packet_size: int = 1400
+    pmtud: bool = False
+    pmtud_probe_size: int = 1420
+    log_level: str = "info"
 
-@app.post('/mlvpn', summary="Modify MLVPN configuration")
-def mlvpn(*, params: MLVPN, current_user: User = Depends(get_current_user)):
+@app.post('/mqvpn', summary="Modify MQVPN configuration")
+def mqvpn(*, params: MQVPN, current_user: User = Depends(get_current_user)):
     if current_user.permissions == "ro":
-        #set_lastchange(10)
-        return {'result': 'permission', 'reason': 'Read only user', 'route': 'mlvpn'}
-    if not os.path.isfile('/etc/mlvpn/mlvpn0.conf'):
-        return {'result': 'warning', 'reason': 'MLVPN is not installed', 'route': 'mlvpn'}
-    initial_md5 = hashlib.md5(file_as_bytes(open('/etc/mlvpn/mlvpn0.conf', 'rb'))).hexdigest()
-    mlvpn_config = configparser.ConfigParser()
-    mlvpn_config.read_file(open(r'/etc/mlvpn/mlvpn0.conf'))
-    mlvpn_config.set('general', 'password', '"' + params.password + '"')
-    mlvpn_config.set('general', 'timeout',str(params.timeout))
-    mlvpn_config.set('general', 'reorder_buffer_size',str(params.reorder_buffer_size))
-    mlvpn_config.set('general', 'loss_tolerence',str(params.loss_tolerence))
-    mlvpn_config.set('general', 'cleartext_data',str(params.cleartext_data))
-    with open('/etc/mlvpn/mlvpn0.conf','w') as mlvpn_file:
-        mlvpn_config.write(mlvpn_file)
-    final_md5 = hashlib.md5(file_as_bytes(open('/etc/mlvpn/mlvpn0.conf', 'rb'))).hexdigest()
+        return {'result': 'permission', 'reason': 'Read only user', 'route': 'mqvpn'}
+    if not os.path.isfile('/etc/mqvpn/server.conf'):
+        return {'result': 'warning', 'reason': 'MQVPN is not installed', 'route': 'mqvpn'}
+    if params.scheduler not in ['wlb', 'minrtt', 'backup', 'backup_fec', 'rap']:
+        return {'result': 'error', 'reason': 'Invalid scheduler', 'route': 'mqvpn'}
+    if params.cc not in ['bbr2', 'bbr', 'cubic', 'new_reno', 'copa', 'unlimited']:
+        return {'result': 'error', 'reason': 'Invalid congestion control', 'route': 'mqvpn'}
+    if params.mtu != 0 and not 1280 <= params.mtu <= 1402:
+        return {'result': 'error', 'reason': 'Invalid tunnel MTU', 'route': 'mqvpn'}
+    if not 1298 <= params.outer_packet_size <= 1472:
+        return {'result': 'error', 'reason': 'Invalid outer packet size', 'route': 'mqvpn'}
+    if not 1298 <= params.pmtud_probe_size <= 1472:
+        return {'result': 'error', 'reason': 'Invalid PMTUD probe size', 'route': 'mqvpn'}
+    if params.log_level not in ['debug', 'info', 'warn', 'error']:
+        return {'result': 'error', 'reason': 'Invalid log level', 'route': 'mqvpn'}
+
+    initial_md5 = hashlib.md5(file_as_bytes(open('/etc/mqvpn/server.conf', 'rb'))).hexdigest()
+    mqvpn_config = configparser.ConfigParser(strict=False)
+    mqvpn_config.optionxform = str
+    mqvpn_config.read_file(open(r'/etc/mqvpn/server.conf'))
+    old_port = ''
+    if mqvpn_config.has_option('Interface', 'Listen'):
+        old_listen = mqvpn_config.get('Interface', 'Listen')
+        if ':' in old_listen:
+            old_port = old_listen.rsplit(':', 1)[1]
+    for section in ['Interface', 'Auth', 'Multipath']:
+        if not mqvpn_config.has_section(section):
+            mqvpn_config.add_section(section)
+    mqvpn_config.set('Interface', 'Listen', '0.0.0.0:' + str(params.port))
+    mqvpn_config.set('Interface', 'MTU', str(params.mtu))
+    mqvpn_config.set('Interface', 'LogLevel', params.log_level)
+    mqvpn_config.set('Auth', 'Key', params.key)
+    mqvpn_config.set('Multipath', 'Scheduler', params.scheduler)
+    mqvpn_config.set('Multipath', 'CC', params.cc)
+    mqvpn_config.set('Multipath', 'OuterPacketSize', str(params.outer_packet_size))
+    mqvpn_config.set('Multipath', 'PMTUD', 'true' if params.pmtud else 'false')
+    mqvpn_config.set('Multipath', 'PMTUDProbeSize', str(params.pmtud_probe_size))
+    with open('/etc/mqvpn/server.conf','w') as mqvpn_file:
+        mqvpn_config.write(mqvpn_file)
+    final_md5 = hashlib.md5(file_as_bytes(open('/etc/mqvpn/server.conf', 'rb'))).hexdigest()
+    if old_port and old_port != str(params.port):
+        shorewall_del_port(PRIMARY_ROUTER_USERNAME, old_port, 'udp', 'mqvpn')
+    shorewall_add_port(get_primary_router_user(), str(params.port), 'udp', 'mqvpn')
     if initial_md5 != final_md5:
-        os.system("systemctl -q restart mlvpn@mlvpn0")
-        #set_lastchange()
-    return {'result': 'done', 'reason': 'changes applied', 'route': 'mlvpn'}
+        os.system("systemctl -q restart mqvpn-server.service")
+    return {'result': 'done', 'reason': 'changes applied', 'route': 'mqvpn'}
+
+class MQVPN2(BaseModel):
+    key: str
+    port: int = Query(65412, gt=0, lt=65535)
+    scheduler: str = "wlb"
+    cc: str = "cubic"
+    mtu: int = 0
+    init_max_path_id: int = Query(128, gt=0, le=128)
+    reorder: bool = False
+    log_level: str = "info"
+
+@app.post('/mqvpn2', summary="Modify experimental MQVPN2 configuration")
+def mqvpn2(*, params: MQVPN2, current_user: User = Depends(get_current_user)):
+    if current_user.permissions == "ro":
+        return {'result': 'permission', 'reason': 'Read only user', 'route': 'mqvpn2'}
+    if not os.path.isfile('/etc/mqvpn2/server.conf'):
+        return {'result': 'warning', 'reason': 'MQVPN2 is not installed', 'route': 'mqvpn2'}
+    if params.scheduler not in ['wlb', 'minrtt', 'wlb_udp_pin', 'backup_fec']:
+        return {'result': 'error', 'reason': 'Invalid scheduler', 'route': 'mqvpn2'}
+    if params.cc not in ['bbr2', 'bbr', 'cubic']:
+        return {'result': 'error', 'reason': 'Invalid congestion control', 'route': 'mqvpn2'}
+    if params.mtu != 0 and not 1280 <= params.mtu <= 9000:
+        return {'result': 'error', 'reason': 'Invalid tunnel MTU', 'route': 'mqvpn2'}
+    if params.log_level not in ['debug', 'info', 'warn', 'error']:
+        return {'result': 'error', 'reason': 'Invalid log level', 'route': 'mqvpn2'}
+
+    initial_md5 = hashlib.md5(
+        file_as_bytes(open('/etc/mqvpn2/server.conf', 'rb'))).hexdigest()
+    mqvpn2_config = configparser.ConfigParser(strict=False)
+    mqvpn2_config.optionxform = str
+    mqvpn2_config.read_file(open(r'/etc/mqvpn2/server.conf'))
+    old_port = ''
+    if mqvpn2_config.has_option('Interface', 'Listen'):
+        old_listen = mqvpn2_config.get('Interface', 'Listen')
+        if ':' in old_listen:
+            old_port = old_listen.rsplit(':', 1)[1]
+    for section in ['Interface', 'Auth', 'Multipath', 'Reorder', 'Hybrid']:
+        if not mqvpn2_config.has_section(section):
+            mqvpn2_config.add_section(section)
+    mqvpn2_config.set('Interface', 'Listen', '0.0.0.0:' + str(params.port))
+    mqvpn2_config.set('Interface', 'MTU', str(params.mtu))
+    mqvpn2_config.set('Interface', 'LogLevel', params.log_level)
+    mqvpn2_config.set('Auth', 'Key', params.key)
+    mqvpn2_config.set('Multipath', 'Scheduler', params.scheduler)
+    mqvpn2_config.set('Multipath', 'CC', params.cc)
+    mqvpn2_config.set('Multipath', 'InitMaxPathId',
+                      str(params.init_max_path_id))
+    mqvpn2_config.set('Reorder', 'Enabled', 'on' if params.reorder else 'off')
+    mqvpn2_config.set('Hybrid', 'Enabled', 'false')
+    with open('/etc/mqvpn2/server.conf', 'w') as mqvpn2_file:
+        mqvpn2_config.write(mqvpn2_file)
+    final_md5 = hashlib.md5(
+        file_as_bytes(open('/etc/mqvpn2/server.conf', 'rb'))).hexdigest()
+    if old_port and old_port != str(params.port):
+        shorewall_del_port(PRIMARY_ROUTER_USERNAME, old_port, 'udp', 'mqvpn2')
+    shorewall_add_port(get_primary_router_user(), str(params.port), 'udp', 'mqvpn2')
+    if initial_md5 != final_md5:
+        subprocess.call(['systemctl', '-q', 'restart', 'mqvpn2-server.service'])
+    return {'result': 'done', 'reason': 'changes applied', 'route': 'mqvpn2'}
 
 
 # Set OpenVPN config
@@ -3185,7 +3806,7 @@ def openvpn(*, params: OpenVPN, current_user: User = Depends(get_current_user)):
 
     if initial_md5 != final_md5:
         os.system("systemctl -q restart openvpn@tun0")
-        shorewall_add_port(current_user, str(params.port), 'tcp', 'openvpn')
+        shorewall_add_port(get_primary_router_user(), str(params.port), 'tcp', 'openvpn')
         #set_lastchange()
     return {'result': 'done'}
 
@@ -3224,7 +3845,7 @@ def softethervpn(*, params: SoftEtherVPN, current_user: User = Depends(get_curre
             "method": "SetUser",
             "params": {
                 "HubName_str": "OMRVPN",
-                "Name_str": current_user,
+                "Name_str": PRIMARY_ROUTER_USERNAME,
                 "Auth_Password_str": params.password 
             }
         }
@@ -3236,7 +3857,6 @@ def softethervpn(*, params: SoftEtherVPN, current_user: User = Depends(get_curre
         except requests.exceptions.RequestException as err:
             LOG.debug("SoftEther VPN change password error (" + str(err) + ")")
             return {'result': 'error'}
-    #shorewall_add_port(current_user, str(params.port), 'tcp', 'softethervpn')
     return {'result': 'done'}
 
 # Set WireGuard config
@@ -3271,7 +3891,7 @@ def wireguard(*, params: WireGuard, current_user: User = Depends(get_current_use
     final_md5 = hashlib.md5(file_as_bytes(open('/etc/wireguard/wg0.conf', 'rb'))).hexdigest()
     if initial_md5 != final_md5:
         os.system("wg setconf wg0 /etc/wireguard/wg0.conf")
-        shorewall_add_port(current_user, str(wg_port), 'udp', 'wireguard')
+        shorewall_add_port(get_primary_router_user(), str(wg_port), 'udp', 'wireguard')
         #set_lastchange()
     return {'result': 'done', 'reason': 'changes applied', 'route': 'wireguard'}
 
@@ -3327,7 +3947,6 @@ def wan(*, wanips: Wanips, current_user: User = Depends(get_current_user)):
         outfile.write('[white_list]\n')
         outfile.write(ips)
     final_md5 = hashlib.md5(file_as_bytes(open('/etc/shadowsocks-libev/local.acl', 'rb'))).hexdigest()
-    #modif_config_user(current_user.username,{'wanips': wanip})
     return {'result': 'done', 'reason': 'changes applied', 'route': 'wan'}
 
 class Lanips(BaseModel):
@@ -3342,31 +3961,7 @@ def lan(*, lanconfig: Lanips, current_user: User = Depends(get_current_user)):
     if not lanips:
         return {'result': 'error', 'reason': 'Invalid parameters', 'route': 'lan'}
     LOG.debug("modif_config_user for lanip")
-    modif_config_user(current_user.username, {'lanips': lanips})
-    with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
-        omr_config_data = json.load(f)
-    client2client = False
-    if 'client2client' in omr_config_data:
-        client2client = omr_config_data["client2client"]
-    if client2client == True and os.path.isfile('/etc/openvpn/tun0.conf'):
-        with open('/etc/openvpn/ccd/' + current_user.username, 'w') as outfile:
-            for lan in lanips:
-                ip = IPNetwork(lan)
-                outfile.write('iroute ' + str(ip.network) + ' ' + str(ip.netmask) + "\n")
-                #outfile.write('route ' + str(ip.network) + ' ' + str(ip.netmask) + "\n")
-        initial_md5 = hashlib.md5(file_as_bytes(open('/etc/openvpn/tun0.conf', 'rb'))).hexdigest()
-        fd, tmpfile = mkstemp()
-        with open('/etc/openvpn/tun0.conf', 'r') as f, open(tmpfile, 'a+') as n:
-            for line in f:
-                if not 'push "route ' + str(ip.network) + ' ' + str(ip.netmask) + '"' in line:
-                    n.write(line)
-            n.write('push "route ' + str(ip.network) + ' ' + str(ip.netmask) + '"' + "\n")
-        os.close(fd)
-        move(tmpfile, '/etc/openvpn/tun0.conf')
-        final_md5 = hashlib.md5(file_as_bytes(open('/etc/openvpn/tun0.conf', 'rb'))).hexdigest()
-        if initial_md5 != final_md5:
-            os.system("systemctl -q restart openvpn@tun0")
-            #set_lastchange()
+    modif_config_user(PRIMARY_ROUTER_USERNAME, {'lanips': lanips})
     return {'result': 'done', 'reason': 'changes applied', 'route': 'lan'}
 
 class VPNips(BaseModel):
@@ -3390,20 +3985,19 @@ def vpnips(*, vpnconfig: VPNips, current_user: User = Depends(get_current_user))
         return {'result': 'done', 'reason': 'No changes', 'route': 'vpnips'}
     with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
         omr_config_data = json.load(f)
-    if 'vpnremoteip' in omr_config_data['users'][0][current_user.username] and omr_config_data['users'][0][current_user.username]['vpnremoteip'] == remoteip and 'vpnlocalip' in omr_config_data['users'][0][current_user.username] and omr_config_data['users'][0][current_user.username]['vpnlocalip'] == localip and ula and ('ula' in omr_config_data['users'][0][current_user.username] and omr_config_data['users'][0][current_user.username]['ula'] == ula):
+    router_config = omr_config_data['users'][0][PRIMARY_ROUTER_USERNAME]
+    if 'vpnremoteip' in router_config and router_config['vpnremoteip'] == remoteip and 'vpnlocalip' in router_config and router_config['vpnlocalip'] == localip and ula and ('ula' in router_config and router_config['ula'] == ula):
         return {'result': 'error', 'reason': 'Invalid parameters', 'route': 'vpnips'}
-    if 'vpnremoteip' not in omr_config_data['users'][0][current_user.username] or omr_config_data['users'][0][current_user.username]['vpnremoteip'] != remoteip:
+    if 'vpnremoteip' not in router_config or router_config['vpnremoteip'] != remoteip:
         LOG.debug("modif_config_user for vpnips")
-        modif_config_user(current_user.username, {'vpnremoteip': remoteip})
-    if 'vpnlocalip' not in omr_config_data['users'][0][current_user.username] or omr_config_data['users'][0][current_user.username]['vpnlocalip'] != localip:
+        modif_config_user(PRIMARY_ROUTER_USERNAME, {'vpnremoteip': remoteip})
+    if 'vpnlocalip' not in router_config or router_config['vpnlocalip'] != localip:
         LOG.debug("modif_config_user for vpn local ip")
-        modif_config_user(current_user.username, {'vpnlocalip': localip})
-    if ula and ('ula' not in omr_config_data['users'][0][current_user.username] or omr_config_data['users'][0][current_user.username]['ula'] != ula):
+        modif_config_user(PRIMARY_ROUTER_USERNAME, {'vpnlocalip': localip})
+    if ula and ('ula' not in router_config or router_config['ula'] != ula):
         LOG.debug("modif_config_user for ula")
-        modif_config_user(current_user.username, {'ula': ula})
-    userid = current_user.userid
-    if userid is None:
-        userid = 0
+        modif_config_user(PRIMARY_ROUTER_USERNAME, {'ula': ula})
+    userid = 0
 
     if not '6in4' in omr_config_data or omr_config_data['6in4']:
         if os.path.isfile('/etc/openmptcprouter-vps-admin/omr-6in4/user' + str(userid)):
@@ -3481,321 +4075,6 @@ def vpnips(*, vpnconfig: VPNips, current_user: User = Depends(get_current_user))
 
     return {'result': 'done', 'reason': 'changes applied', 'route': 'vpnips'}
 
-# Update VPS
-@app.get('/update', summary="Update VPS script")
-def update(current_user: User = Depends(get_current_user)):
-    if current_user.permissions == "ro":
-        return {'result': 'permission', 'reason': 'Read only user', 'route': 'update'}
-    LOG.debug("Update VPS...")
-    with open("/etc/openmptcprouter-vps-admin/update", mode='a'): pass
-    os.system("systemctl -q stop omr")
-    os.system("systemctl -q restart omr-update")
-    LOG.debug("Update VPS... done")
-    return {'result': 'done', 'route': 'update'}
-
-# Backup
-class Backupfile(BaseModel):
-    data: str = Query(..., title="OpenMPTCProuter backup file in tar.gz encoded in base64")
-
-@app.post('/backuppost', summary="Send current user router backup file")
-def backuppost(*, backupfile: Backupfile, current_user: User = Depends(get_current_user)):
-    if current_user.permissions == "ro":
-        return {'result': 'permission', 'reason': 'Read only user', 'route': 'backuppost'}
-    backup_file = backupfile.data
-    if not backup_file:
-        return {'result': 'error', 'reason': 'Invalid parameters', 'route': 'backuppost'}
-    with open('/var/opt/openmptcprouter/' + current_user.username + '-backup.tar.gz', 'wb') as f, open('/var/opt/openmptcprouter/' + current_user.username + '-' + str(int(time.time())) + '-backup.tar.gz', 'wb') as g:
-        g.write(base64.b64decode(backup_file))
-        f.write(base64.b64decode(backup_file))
-    delete_oldest_files('/var/opt/openmptcprouter/' + current_user.username + '-*-backup.tar.gz')
-    return {'result': 'done', 'route': 'backuppost'}
-
-@app.get('/backupget', summary="Get current user router backup file")
-def send_backup(filename: Optional[str] = Query(None), current_user: User = Depends(get_current_user)):
-    if filename is not None and current_user.username in filename:
-        with open('/var/opt/openmptcprouter/' + filename, "rb") as backup_file:
-            file_base64 = base64.b64encode(backup_file.read())
-            file_base64utf = file_base64.decode('utf-8')
-    else:
-        with open('/var/opt/openmptcprouter/' + current_user.username + '-backup.tar.gz', "rb") as backup_file:
-            file_base64 = base64.b64encode(backup_file.read())
-            file_base64utf = file_base64.decode('utf-8')
-    return {'data': file_base64utf}
-
-@app.get('/backuplist', summary="List available current user backup")
-def list_backup(current_user: User = Depends(get_current_user)):
-    files = glob.glob('/var/opt/openmptcprouter/' + current_user.username + '*' + '-backup.tar.gz')
-    fileData = {}
-    for fname in files:
-        fileData[os.path.relpath(fname,'/var/opt/openmptcprouter/')] = os.stat(fname).st_mtime
-    sorted_files = sorted(fileData.items(), key = itemgetter(1))
-    modiftime = "0"
-    if os.path.isfile('/var/opt/openmptcprouter/' + current_user.username + '-backup.tar.gz'):
-        modiftime = os.path.getmtime('/var/opt/openmptcprouter/' + current_user.username + '-backup.tar.gz')
-    if len(sorted_files) > 0:
-        return {'backup': True, 'modif': modiftime,'sorted': sorted_files}
-    else:
-        return {'backup': False}
-
-#@app.get('/backupshow', summary="Show current user backup")
-#def show_backup(current_user: User = Depends(get_current_user)):
-#    if os.path.isfile('/var/opt/openmptcprouter/' + current_user.username + '-backup.tar.gz'):
-#        router = OpenWrt(native=open('/var/opt/openmptcprouter/' + current_user.username + '-backup.tar.gz'))
-#        return {'backup': True, 'data': router}
-#    else:
-#        return {'backup': False}
-
-#@app.post('/backupedit', summary="Modify current user backup")
-#def edit_backup(params, current_user: User = Depends(get_current_user)):
-#    if current_user.permissions == "ro":
-#        return {'result': 'permission', 'reason': 'Read only user', 'route': 'backupedit'}
-#    o = OpenWrt(params)
-#    o.write(current_user.username + '-backup', path='/var/opt/openmptcprouter/')
-#    return {'result': 'done'}
-
-#class VPN(str, Enum):
-#    openvpn = "openvpn"
-#    glorytuntcp = "glorytun_tcp"
-#    glorytunudp = "glorytun_udp"
-#    dsvpn = "dsvpn"
-
-class permissions(str, Enum):
-    ro = "ro"
-    rw = "rw"
-    admin = "admin"
-
-class NewUser(BaseModel):
-    username: str = Query(..., title="Username")
-    permission: permissions = Query("ro", title="permission of the user")
-    vpn: VPN = Query("openvpn", title="default VPN for the user")
-    proxy: PROXY = Query("shadowsocks-rust", title="default Proxy for the user")
-    shadowsocks_port: Optional[int] = Query(None, gt=0, lt=65535, title="Shadowsocks-libev port")
-    userid: Optional[int] = Query(None, title="User ID")
-    ips: Optional[List[str]] = Query(None, title="Public exit IP (only one supported for now)")
-    user_key: Optional[str] = Query(None, title="User key")
-    shadowsocks_key: Optional[str] = Query(None, title="Shadowsocks key")
-    shadowsocks2022_key: Optional[str] = Query(None, title="Shadowsocks 2022 key")
-    softethervpn_pass: Optional[str] = Query(None, title="SoftEther VPN password")
-
-@app.post('/add_user', summary="Add a new user")
-def add_user(*, params: NewUser, current_user: User = Depends(get_current_user), request: Request):
-    if not current_user.permissions == "admin":
-        return {'result': 'permission', 'reason': 'Need admin user', 'route': 'add_user'}
-    with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
-        content = json.load(f)
-    userid = params.userid
-    if userid is None or userid == 0:
-        userid = 2
-        for users in content['users'][0]:
-            if 'userid' in content['users'][0][users]:
-                if int(content['users'][0][users]['userid']) > userid:
-                    userid = int(content['users'][0][users]['userid'])
-        userid = userid + 1
-    if params.ips is None:
-        publicips = []
-    else:
-        publicips = params.ips
-    user_key = secrets.token_hex(32)
-    user_json = json.loads('{"'+ params.username + '": {"username":"'+ params.username +'","permissions":"'+params.permission+'","user_password": "'+user_key.upper()+'","disabled":"false","userid":"' + str(userid) + '","public_ips":'+ json.dumps(publicips) +'}}')
-#    shadowsocks_port = params.shadowsocks_port
-#    if params.shadowsocks_port is None:
-#    shadowsocks_port = '651{:02d}'.format(userid)
-    shadowsocks_port = params.shadowsocks_port
-    shadowsocks_key = params.shadowsocks_key
-    if shadowsocks_key is None:
-        shadowsocks_key = base64.urlsafe_b64encode(secrets.token_hex(16).encode()).decode('utf-8')
-    shadowsocks2022_key = params.shadowsocks2022_key
-    if shadowsocks2022_key is None:
-        shadowsocks2022_key = base64.urlsafe_b64encode(secrets.token_hex(16).encode()).decode('utf-8')
-    if not publicips:
-        if os.path.isfile('/etc/shadowsocks-libev/manager.json'):
-            shadowsocks_port = add_ss_user(str(shadowsocks_port), shadowsocks_key, userid)
-        if os.path.isfile('/etc/shadowsocks-go/server.json'):
-            upsk = add_ss_go_user(params.username, shadowsocks2022_key)
-        else:
-            upsk = ''
-        if os.path.isfile('/etc/v2ray/v2ray-server.json'):
-            if params.proxy is not None and params.proxy == 'v2ray-vmess':
-                uuid = v2ray_add_user(params.username,'',0)
-            else:
-                uuid = v2ray_add_user(params.username)
-        else:
-            uuid = ''
-        if os.path.isfile('/etc/xray/xray-server.json'):
-            xray_add_user(params.username,uuid,upsk)
-    else:
-        for publicip in publicips:
-            if os.path.isfile('/etc/shadowsocks-libev/manager.json'):
-                shadowsocks_port = add_ss_user(str(shadowsocks_port), shadowsocks_key.decode('utf-8'), userid, publicip)
-                shadowsocks_port = shadowsocks_port + 1
-            if os.path.isfile('/etc/xray/xray-server.json'):
-                xray_add_user(params.username,uuid,upsk)
-            add_gre_tunnels(params.username, publicip)
-    if shadowsocks_port is not None:
-        user_json[params.username].update({"shadowsocks_port": shadowsocks_port})
-    if params.vpn is not None:
-        user_json[params.username].update({"vpn": params.vpn})
-    if params.proxy is not None:
-        user_json[params.username].update({"proxy": params.proxy})
-    content['users'][0].update(user_json)
-    if content:
-        LOG.debug("backup_config() in add user")
-        backup_config()
-        with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json', 'w') as f:
-            json.dump(content, f, indent=4)
-    else:
-        LOG.debug("Empty data for add_user")
-    # Create VPNs configuration
-    if os.path.isfile('/etc/openvpn/tun0.conf'):
-        LOG.debug("Create user " + params.username + " in OpenVPN")
-        os.system('cd /etc/openvpn/ca && EASYRSA_CERT_EXPIRE=3650 ./easyrsa --batch build-client-full "' + params.username + '" nopass' + ' >/dev/null 2>&1')
-    if os.path.isfile('/etc/glorytun-tcp/tun0'):
-        LOG.debug("Create user " + params.username + " in Glorytun-TCP")
-        add_glorytun_tcp(userid)
-    if os.path.isfile('/etc/glorytun-udp/tun0'):
-        LOG.debug("Create user " + params.username + " in Glorytun-UDP")
-        add_glorytun_udp(userid)
-    if os.path.isfile('/etc/dsvpn/dsvpn0'):
-        LOG.debug("Create user " + params.username + " in DSVPN")
-        add_dsvpn(userid)
-    if os.path.isfile('/var/lib/softether/vpn_server.config'):
-        LOG.debug("Create user " + params.username + " in SoftEther VPN")
-        if softethervpn_pass is None:
-            sofethervpn_pass = base64.urlsafe_b64encode(secrets.token_hex(16).encode()).decode('utf-8')
-        add_softether_user(userid,softether_pass)
-        modif_config_user(userid,{'softethervpn': {'password': softethervpn_pass}})
-
-    LOG.info("User admin (IP: " + request.client.host + ") added user " + params.username)
-
-    #set_lastchange(30)
-    #os.execv(__file__, sys.argv)
-    #with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
-    #    global fake_users_db
-    #    omr_config_data = json.load(f)
-    #    fake_users_db = omr_config_data['users'][0]
-
-class ExistingUser(BaseModel):
-    username: str = Query(..., title="Username")
-    note: list = []
-
-@app.post('/add_user_note', summary="Add a note to an user")
-def add_user_note(*, params: ExistingUser, current_user: User = Depends(get_current_user)):
-    if not current_user.permissions == "admin":
-        return {'result': 'permission', 'reason': 'Need admin user', 'route': 'add_user'}
-    modif_config_user(params.username,{"note": params.note})
-    #set_lastchange(30)
-
-
-class RemoveUser(BaseModel):
-    username: str
-
-@app.post('/remove_user', summary="Remove an user")
-def remove_user(*, params: RemoveUser, current_user: User = Depends(get_current_user), request: Request):
-    if not current_user.permissions == "admin":
-        return {'result': 'permission', 'reason': 'Need admin user', 'route': 'remove_user'}
-    with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
-        content = json.load(f)
-    if not params.username in content['users'][0]:
-        return {'result': 'error', 'reason': 'User doesnt exist', 'route': 'remove_user'}
-    LOG.debug("Remove user " + params.username)
-    userid = int(content['users'][0][params.username]['userid'])
-    if userid == 0:
-        return {'result': 'not allowed', 'reason': 'Userid 0 is protected', 'route': 'remove_user'}
-    if os.path.isfile('/etc/shadowsocks-libev/manager.json'):
-        shadowsocks_port = content['users'][0][params.username]['shadowsocks_port']
-        remove_ss_user(str(shadowsocks_port))
-    if os.path.isfile('/etc/shadowsocks-go/server.json'):
-        remove_ss_go_user(params.username)
-    if os.path.isfile('/etc/v2ray/v2ray-server.json'):
-        v2ray_del_user(params.username)
-    if os.path.isfile('/etc/xray/xray-server.json'):
-        xray_del_user(params.username)
-    del content['users'][0][params.username]
-    if content:
-        LOG.debug("backup_config() in remove user")
-        backup_config()
-        with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json', 'w') as f:
-            json.dump(content, f, indent=4)
-    else:
-        LOG.debug("Empty data for remover_user")
-    if os.path.isfile('/etc/openvpn/tun0.conf'):
-        os.system('cd /etc/openvpn/ca && ./easyrsa --batch revoke ' + params.username + ' >/dev/null 2>&1')
-        os.system('cd /etc/openvpn/ca && EASYRSA_CRL_DAYS=3650 ./easyrsa gen-crl' + ' >/dev/null 2>&1')
-        os.system('chmod 644 /etc/openvpn/ca/pki/crl.pem' + ' >/dev/null 2>&1')
-        os.system('rm -f /etc/openvpn/ca/pki/reqs/' + params.username + '.req' + ' >/dev/null 2>&1')
-        # Kill user via OpenVPN API
-        try:
-            ovpn_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            ovpn_socket.settimeout(2)
-            ovpn_socket.connect(("127.0.0.1", 65302))
-            fd = ovpn_socket.makefile('rb')
-            line = fd.readline()
-            if not line.startswith('>INFO:OpenVPN'.encode()):
-                ovpn_socket.close()
-                LOG.debug("OpenVPN error")
-            else:
-                ovpn_socket.send('kill ' + params.username + '\r\n'.encode())
-            ovpn_socket.close()
-        except socket.timeout as err:
-            LOG.debug("OpenVPN stats timeout (" + str(err) + ")")
-        except socket.error as err:
-            LOG.debug("OpenVPN stats error (" + str(err) + ")")
-        #os.system("systemctl -q restart openvpn@tun0" + ' >/dev/null 2>&1')
-    if os.path.isfile('/etc/glorytun-tcp/tun0'):
-        remove_glorytun_tcp(userid)
-    if os.path.isfile('/etc/glorytun-udp/tun0'):
-        remove_glorytun_udp(userid)
-    if os.path.isfile('/etc/dsvpn/dsvpn0'):
-        remove_dsvpn(userid)
-    if os.path.isfile('/var/lib/softether/vpn_server.config'):
-        remove_softether_user(userid)
-    LOG.info("User admin (IP: " + request.client.host + ") removed user " + params.username)
-    #set_lastchange(30)
-    #os.execv(__file__, sys.argv)
-    #with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
-    #    global fake_users_db
-    #    omr_config_data = json.load(f)
-    #    fake_users_db = omr_config_data['users'][0]
-
-class ClienttoClient(BaseModel):
-    enable: bool = False
-
-@app.post('/client2client', summary="Enable client 2 client communications")
-def client2client(*, params: ClienttoClient, current_user: User = Depends(get_current_user)):
-    if not current_user.permissions == "admin":
-        return {'result': 'permission', 'reason': 'Need admin user', 'route': 'client2client'}
-    set_global_param('client2client', params.enable)
-    initial_md5 = hashlib.md5(file_as_bytes(open('/etc/openvpn/tun0.conf', 'rb'))).hexdigest()
-    fd, tmpfile = mkstemp()
-    if os.path.isfile('/etc/openvpn/tun0.conf'):
-        with open('/etc/openvpn/tun0.conf', 'r') as f, open(tmpfile, 'a+') as n:
-            for line in f:
-                if not 'client-to-client' in line:
-                    n.write(line)
-            if params.enable == True:
-                n.write('client-to-client' + "\n")
-        os.close(fd)
-        move(tmpfile, '/etc/openvpn/tun0.conf')
-        final_md5 = hashlib.md5(file_as_bytes(open('/etc/openvpn/tun0.conf', 'rb'))).hexdigest()
-        if initial_md5 != final_md5:
-            os.system("systemctl -q restart openvpn@tun0")
-    initial_md5 = hashlib.md5(file_as_bytes(open('/etc/shorewall/policy', 'rb'))).hexdigest()
-    fd, tmpfile = mkstemp()
-    with open('/etc/shorewall/policy', 'r') as f, open(tmpfile, 'a+') as n:
-        for line in f:
-            if not line == 'vpn		vpn		DROP\n' and not line == '# THE FOLLOWING POLICY MUST BE LAST\n' and not line == 'all		all		REJECT		info\n':
-                n.write(line)
-        if params.enable == False:
-            n.write('vpn		vpn		DROP\n')
-        n.write('# THE FOLLOWING POLICY MUST BE LAST\n')
-        n.write('all		all		REJECT		info\n')
-    os.close(fd)
-    move(tmpfile, '/etc/shorewall/policy')
-    final_md5 = hashlib.md5(file_as_bytes(open('/etc/shorewall/policy', 'rb'))).hexdigest()
-    if initial_md5 != final_md5:
-        os.system("systemctl -q reload shorewall")
-    return {'result': 'done'}
-
 class SerialEnforce(BaseModel):
     enable: bool = False
 
@@ -3805,23 +4084,6 @@ def serialenforce(*, params: SerialEnforce, current_user: User = Depends(get_cur
         return {'result': 'permission', 'reason': 'Need admin user', 'route': 'serialenforce'}
     set_global_param('serial_enforce', params.enable)
     return {'result': 'done'}
-
-@app.get('/list_users', summary="List all users")
-async def list_users(current_user: User = Depends(get_current_user)):
-    if not current_user.permissions == "admin":
-        return {'result': 'permission', 'reason': 'Need admin user', 'route': 'list_users'}
-    with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
-        content = json.load(f)
-    return content['users'][0]
-
-@app.get('/get-number-of-users', summary="Get the total number of users")
-def get_number_of_users(current_user: User = Depends(get_current_user)):
-    if not current_user.permissions == "admin":
-        return {'result': 'permission', 'reason': 'Need admin user', 'route': 'get-number-of-users'}
-    with open('/etc/openmptcprouter-vps-admin/omr-admin-config.json') as f:
-        content = json.load(f)
-        users = len(content['users'][0]) - 1
-    return {'users': users}
 
 @app.get('/speedtest', summary="Test speed from the server")
 async def speedtest(current_user: User = Depends(get_current_user)):
