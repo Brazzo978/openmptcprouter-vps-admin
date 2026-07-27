@@ -69,6 +69,20 @@ logging.basicConfig(level=logging.INFO,
 #LOG = logging.getLogger('OMR-Admin')
 LOG = logging.getLogger('uvicorn.error')
 
+
+class FailedAccessOnlyFilter(logging.Filter):
+    """Keep failed HTTP requests; successful API calls have structured logs."""
+
+    def filter(self, record):
+        try:
+            status_code = int(record.args[4])
+        except (AttributeError, IndexError, TypeError, ValueError):
+            return True
+        return status_code >= 400
+
+
+logging.getLogger('uvicorn.access').addFilter(FailedAccessOnlyFilter())
+
 PERMANENT_SESSION_LIFETIME = timedelta(hours=24)
 ACCESS_TOKEN_EXPIRE_MINUTES = 1440
 ALGORITHM = "HS256"
@@ -84,6 +98,118 @@ NANBBR_VAR_MODULES = {
     'nanbbr2_var': 'tcp_nanbbr2_var',
     'nanbbr3_var': 'tcp_nanbbr3_var',
 }
+DIAGNOSTIC_JOURNAL_UNITS = (
+    'omr-admin.service',
+    'omr.service',
+    'mqvpn-server.service',
+    'mqvpn2-server.service',
+    'glorytun-tcp@tun0.service',
+    'glorytun-udp@tun0.service',
+    'openvpn@tun0.service',
+    'shorewall.service',
+)
+DIAGNOSTIC_SEVERITIES = {
+    0: 'error', 1: 'error', 2: 'error', 3: 'error',
+    4: 'warning', 5: 'notice', 6: 'info', 7: 'debug',
+}
+DIAGNOSTIC_REDACTIONS = (
+    re.compile(r'(?i)(authorization:\s*bearer\s+)\S+'),
+    re.compile(r'(?i)((?:password|passwd|token|secret|key)\s*[=:]\s*)\S+'),
+)
+
+
+def redact_diagnostic_message(message):
+    message = str(message)[:4000]
+    for pattern in DIAGNOSTIC_REDACTIONS:
+        message = pattern.sub(r'\1[redacted]', message)
+    return message
+
+
+def diagnostic_component(unit, source, message):
+    text = ' '.join((unit, source, message)).lower()
+    if 'mqvpn2' in text:
+        return 'mqvpn2'
+    if 'mqvpn' in text or 'xquic' in text:
+        return 'mqvpn'
+    if 'glorytun' in text or 'openvpn' in text:
+        return 'vpn'
+    if 'shorewall' in text or 'firewall' in text:
+        return 'firewall'
+    if 'mptcp' in text or 'nanbbr' in text:
+        return 'mptcp'
+    return 'vps'
+
+
+def normalize_diagnostic_severity(priority, message):
+    severity = DIAGNOSTIC_SEVERITIES.get(priority, 'info')
+    if '[DBG]' in message:
+        severity = 'debug'
+    elif '[INF]' in message:
+        severity = 'info'
+    elif '[WRN]' in message:
+        severity = 'warning'
+    elif '[ERR]' in message:
+        severity = 'error'
+    lower_message = message.lower()
+    benign = (
+        'err:0x0' in lower_message
+        and ('local close' in lower_message or 'remote close' in lower_message)
+    )
+    if benign:
+        severity = 'info'
+    return severity, benign
+
+
+def diagnostic_journal_entries(limit):
+    service_command = [
+        'journalctl', '--no-pager', '-o', 'json', '-n', str(limit),
+    ]
+    for unit in DIAGNOSTIC_JOURNAL_UNITS:
+        if unit != 'omr-admin.service':
+            service_command.extend(('-u', unit))
+    admin_command = [
+        'journalctl', '--no-pager', '-o', 'json',
+        '-n', str(min(max(limit * 10, 1000), 10000)),
+        '-u', 'omr-admin.service',
+    ]
+    results = [
+        subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        for command in (service_command, admin_command)
+    ]
+    entries = []
+    for line in '\n'.join(result.stdout for result in results).splitlines():
+        try:
+            record = json.loads(line)
+            message = redact_diagnostic_message(record.get('MESSAGE', ''))
+            unit = record.get('_SYSTEMD_UNIT', '')
+            source = record.get('SYSLOG_IDENTIFIER') or unit or 'systemd'
+            priority = int(record.get('PRIORITY', 6))
+            severity, benign = normalize_diagnostic_severity(priority, message)
+            timestamp = int(record.get('__REALTIME_TIMESTAMP', '0')) / 1000000
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if unit == 'omr-admin.service' and re.search(
+                r'"(?:GET|POST|PUT|DELETE|PATCH) [^"]+ HTTP/1\.[01]" [23]\d\d',
+                message):
+            continue
+        entries.append({
+            'timestamp': timestamp,
+            'scope': 'vps',
+            'source': source,
+            'unit': unit,
+            'component': diagnostic_component(unit, source, message),
+            'severity': severity,
+            'benign': benign,
+            'message': message,
+        })
+    entries.sort(key=lambda entry: entry['timestamp'], reverse=True)
+    return entries[:limit], max(result.returncode for result in results)
 
 
 def nanbbr_parameter_path(congestion_control):
@@ -1739,6 +1865,28 @@ async def get_current_active_user(current_user: User = Depends(get_current_user)
     if current_user.disabled:
         raise HTTPException(status_code=400, detail="Inactive user")
     return current_user
+
+
+@app.get('/diagnostic/logs', summary="Get recent OpenMPTCProuter service logs")
+async def diagnostic_logs(
+        limit: int = Query(250, ge=1, le=1000),
+        current_user: User = Depends(get_current_user)):
+    try:
+        entries, journal_status = diagnostic_journal_entries(limit)
+    except (OSError, subprocess.SubprocessError) as error:
+        LOG.warning("event=diagnostic_logs status=failed error=%s",
+                    type(error).__name__)
+        return {
+            'entries': [],
+            'count': 0,
+            'error': 'VPS journal unavailable',
+        }
+    return {
+        'entries': entries,
+        'count': len(entries),
+        'journal_status': journal_status,
+    }
+
 
 # Show something at homepage
 @app.get("/")
@@ -3716,6 +3864,12 @@ def mqvpn(*, params: MQVPN, current_user: User = Depends(get_current_user)):
     shorewall_add_port(get_primary_router_user(), str(params.port), 'udp', 'mqvpn')
     if initial_md5 != final_md5:
         os.system("systemctl -q restart mqvpn-server.service")
+    LOG.info(
+        "event=vpn_config vpn=mqvpn changed=%s port=%s scheduler=%s cc=%s "
+        "mtu=%s pmtud=%s log_level=%s",
+        initial_md5 != final_md5, params.port, params.scheduler, params.cc,
+        params.mtu, params.pmtud, params.log_level,
+    )
     return {'result': 'done', 'reason': 'changes applied', 'route': 'mqvpn'}
 
 class MQVPN2(BaseModel):
@@ -3775,6 +3929,12 @@ def mqvpn2(*, params: MQVPN2, current_user: User = Depends(get_current_user)):
     shorewall_add_port(get_primary_router_user(), str(params.port), 'udp', 'mqvpn2')
     if initial_md5 != final_md5:
         subprocess.call(['systemctl', '-q', 'restart', 'mqvpn2-server.service'])
+    LOG.info(
+        "event=vpn_config vpn=mqvpn2 changed=%s port=%s scheduler=%s cc=%s "
+        "mtu=%s reorder=%s log_level=%s",
+        initial_md5 != final_md5, params.port, params.scheduler, params.cc,
+        params.mtu, params.reorder, params.log_level,
+    )
     return {'result': 'done', 'reason': 'changes applied', 'route': 'mqvpn2'}
 
 
